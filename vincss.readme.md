@@ -196,3 +196,27 @@ Both scalar claims (`"role": "owner"`) and array claims (`"groups": ["admins", "
 | `Failed to verify VinCSS OIDC ID token`                      | JWKS does not contain the key that signed the ID token (key rotation lag, wrong `kid`).         |
 | `VinCSS OIDC user "..." has no roles matched by claims_to_roles` | The claim/value pair the user actually has does not appear in any `claims_to_roles` entry.  |
 | `VinCSS OIDC discovery failed`                                | `issuer_url` unreachable, returns non-200, or the discovery JSON lacks `jwks_uri`.              |
+
+---
+
+## Disabling the upstream release / security-patch check
+
+By default the auth server periodically calls the GitHub releases API and emits the cluster alert banner *"A security patch is available for Teleport. Please upgrade your Cluster to vX.Y.Z or newer."* in the Web UI when a newer release is found.
+
+Set this env var on the auth process to turn the check (and the banner) off:
+
+| Variable                          | Value | Effect                                                                                                                 |
+| --------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------- |
+| `TELEPORT_DISABLE_RELEASE_CHECK`  | `yes` | Auth server skips the periodic remote (GitHub) and local release checks. No `upgrade-suggestion` or `security-patch-available` cluster alerts are produced. |
+
+Notes:
+
+- The gate is registered at startup (lib/auth/auth.go, `runPeriodicOperations`), so the env var must be set before the auth process starts; changing it at runtime has no effect until restart.
+- Any alert previously written to the backend has a 30-minute TTL and will expire on its own. To clear it immediately:
+
+  ```bash
+  tctl alerts ack --clear security-patch-available
+  tctl alerts ack --clear upgrade-suggestion
+  ```
+
+- This only affects the version-check banner. Other cluster alerts (license, desktops limit, dynamic labels, etc.) are unaffected.
