@@ -33,6 +33,12 @@ import (
 	"github.com/gravitational/teleport/api/utils"
 )
 
+// OIDCConnectorSubKindVinCSS marks an OIDCConnector as targeting the VinCSS
+// OIDC identity provider. Connectors with this sub-kind are exempt from the
+// "OIDC requires Enterprise" entitlement gate and are served by the
+// in-tree OSS OIDC implementation (lib/auth/oidc_vincss.go).
+const OIDCConnectorSubKindVinCSS = "vincss_oidc"
+
 // OIDCConnector specifies configuration for Open ID Connect compatible external
 // identity provider, e.g. google in some organization
 type OIDCConnector interface {
@@ -419,6 +425,12 @@ func (o *OIDCConnectorV3) CheckAndSetDefaults() error {
 
 	if err := o.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
+	}
+
+	switch o.SubKind {
+	case "", OIDCConnectorSubKindVinCSS:
+	default:
+		return trace.BadParameter("unsupported OIDC connector sub_kind %q", o.SubKind)
 	}
 
 	if name := o.Metadata.Name; slices.Contains(constants.SystemConnectors, name) {
