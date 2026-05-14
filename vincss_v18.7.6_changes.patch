@@ -1,0 +1,2560 @@
+From df8324b53e365332e090c6e68ff6e27a2c53a37d Mon Sep 17 00:00:00 2001
+From: "computer.angel" <computer.angel@gmail.com>
+Date: Wed, 13 May 2026 13:56:29 +0700
+Subject: [PATCH 1/6] Add VinCSS OIDC and OAuth2 connectors support
+
+- Implemented a new OIDC connector for VinCSS with tests to validate the authentication flow.
+- Created a fake OIDC provider for testing purposes, including handling discovery, JWKS, and token issuance.
+- Added support for VinCSS OAuth2 as a sub-kind of the GitHub connector, allowing for custom endpoint configurations.
+- Updated API server to include OIDC login routes and handlers.
+- Documented the setup and usage of VinCSS connectors in vincss.readme.md.
+- Enhanced error handling and logging for OIDC and OAuth2 processes.
+---
+ api/types/github.go          |  57 ++++
+ api/types/oidc.go            |  12 +
+ go.mod                       |   2 +-
+ lib/auth/apiserver.go        |  46 +++
+ lib/auth/auth_with_roles.go  |  22 +-
+ lib/auth/export_test.go      |  12 +
+ lib/auth/github.go           | 129 +++++++--
+ lib/auth/oidc.go             |  50 +++-
+ lib/auth/oidc_vincss.go      | 536 +++++++++++++++++++++++++++++++++++
+ lib/auth/oidc_vincss_test.go | 346 ++++++++++++++++++++++
+ lib/services/github.go       |   5 +-
+ lib/web/apiserver.go         |   6 +
+ lib/web/oidc_login.go        | 181 ++++++++++++
+ vincss.readme.md             | 198 +++++++++++++
+ 14 files changed, 1560 insertions(+), 42 deletions(-)
+ create mode 100644 lib/auth/oidc_vincss.go
+ create mode 100644 lib/auth/oidc_vincss_test.go
+ create mode 100644 lib/web/oidc_login.go
+ create mode 100644 vincss.readme.md
+
+diff --git a/api/types/github.go b/api/types/github.go
+index 5659d0648c..1a18f3c828 100644
+--- a/api/types/github.go
++++ b/api/types/github.go
+@@ -19,6 +19,7 @@ package types
+ import (
+ 	"context"
+ 	"log/slog"
++	"os"
+ 	"time"
+ 
+ 	"github.com/gravitational/trace"
+@@ -31,6 +32,44 @@ import (
+ const (
+ 	GithubURL    = "https://github.com"
+ 	GithubAPIURL = "https://api.github.com"
++
++	// GithubConnectorSubKindVinCSS marks a GithubConnector that targets a
++	// VinCSS OAuth2 identity provider instead of github.com. The connector
++	// reuses GitHub's claims model (orgs/teams) but reads its endpoint URLs
++	// from the spec or the TELEPORT_VINCSS_ENDPOINT_URL /
++	// TELEPORT_VINCSS_API_ENDPOINT_URL environment variables.
++	GithubConnectorSubKindVinCSS = "vincss"
++
++	// EnvVinCSSEndpointURL is the env var that supplies the VinCSS endpoint
++	// URL when the connector spec does not set EndpointURL explicitly.
++	EnvVinCSSEndpointURL = "TELEPORT_VINCSS_ENDPOINT_URL"
++	// EnvVinCSSAPIEndpointURL is the env var that supplies the VinCSS API
++	// endpoint URL when the connector spec does not set APIEndpointURL
++	// explicitly.
++	EnvVinCSSAPIEndpointURL = "TELEPORT_VINCSS_API_ENDPOINT_URL"
++
++	// VinCSSAuthPath is the default OAuth2 authorize path on the VinCSS IdP.
++	VinCSSAuthPath = "oauth2/authorize"
++	// VinCSSTokenPath is the default OAuth2 token-exchange path on the VinCSS IdP.
++	VinCSSTokenPath = "oauth2/token"
++	// VinCSSUserPath is the default API path for the authenticated user's
++	// profile on the VinCSS IdP. The response includes a `teleportGroup`
++	// field that supplies the user's group/team membership; VinCSS does not
++	// expose a separate teams API.
++	VinCSSUserPath = "oauth2/profile"
++
++	// EnvVinCSSAuthPath overrides VinCSSAuthPath when set.
++	EnvVinCSSAuthPath = "TELEPORT_VINCSS_AUTH_PATH"
++	// EnvVinCSSTokenPath overrides VinCSSTokenPath when set.
++	EnvVinCSSTokenPath = "TELEPORT_VINCSS_TOKEN_PATH"
++	// EnvVinCSSUserPath overrides VinCSSUserPath when set.
++	EnvVinCSSUserPath = "TELEPORT_VINCSS_USER_PATH"
++
++	// VinCSSOrganization is the synthetic organization name used to group
++	// the strings returned in the VinCSS userResponse.teleportGroup field
++	// into the existing GitHub-style claims structure. Configure
++	// teams_to_roles entries with this organization name.
++	VinCSSOrganization = "vincss"
+ )
+ 
+ // GithubConnector defines an interface for a Github OAuth2 connector
+@@ -188,6 +227,12 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
+ 		return trace.Wrap(err)
+ 	}
+ 
++	switch c.SubKind {
++	case "", GithubConnectorSubKindVinCSS:
++	default:
++		return trace.BadParameter("unsupported GitHub connector sub_kind %q", c.SubKind)
++	}
++
+ 	// DELETE IN 11.0.0
+ 	if len(c.Spec.TeamsToLogins) > 0 {
+ 		slog.WarnContext(context.Background(), "GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
+@@ -278,11 +323,23 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
+ 
+ // GetEndpointURL returns the endpoint URL
+ func (c *GithubConnectorV3) GetEndpointURL() string {
++	if c.SubKind == GithubConnectorSubKindVinCSS {
++		if c.Spec.EndpointURL != "" {
++			return c.Spec.EndpointURL
++		}
++		return os.Getenv(EnvVinCSSEndpointURL)
++	}
+ 	return GithubURL
+ }
+ 
+ // GetEndpointURL returns the API endpoint URL
+ func (c *GithubConnectorV3) GetAPIEndpointURL() string {
++	if c.SubKind == GithubConnectorSubKindVinCSS {
++		if c.Spec.APIEndpointURL != "" {
++			return c.Spec.APIEndpointURL
++		}
++		return os.Getenv(EnvVinCSSAPIEndpointURL)
++	}
+ 	return GithubAPIURL
+ }
+ 
+diff --git a/api/types/oidc.go b/api/types/oidc.go
+index 865d1f9117..173a0758ca 100644
+--- a/api/types/oidc.go
++++ b/api/types/oidc.go
+@@ -33,6 +33,12 @@ import (
+ 	"github.com/gravitational/teleport/api/utils"
+ )
+ 
++// OIDCConnectorSubKindVinCSS marks an OIDCConnector as targeting the VinCSS
++// OIDC identity provider. Connectors with this sub-kind are exempt from the
++// "OIDC requires Enterprise" entitlement gate and are served by the
++// in-tree OSS OIDC implementation (lib/auth/oidc_vincss.go).
++const OIDCConnectorSubKindVinCSS = "vincss_oidc"
++
+ // OIDCConnector specifies configuration for Open ID Connect compatible external
+ // identity provider, e.g. google in some organization
+ type OIDCConnector interface {
+@@ -421,6 +427,12 @@ func (o *OIDCConnectorV3) CheckAndSetDefaults() error {
+ 		return trace.Wrap(err)
+ 	}
+ 
++	switch o.SubKind {
++	case "", OIDCConnectorSubKindVinCSS:
++	default:
++		return trace.BadParameter("unsupported OIDC connector sub_kind %q", o.SubKind)
++	}
++
+ 	if name := o.Metadata.Name; slices.Contains(constants.SystemConnectors, name) {
+ 		return trace.BadParameter("ID: invalid connector name, %v is a reserved name", name)
+ 	}
+diff --git a/go.mod b/go.mod
+index fdd76c8e2c..b9bdb86a5b 100644
+--- a/go.mod
++++ b/go.mod
+@@ -354,7 +354,7 @@ require (
+ 	github.com/containerd/log v0.1.0 // indirect
+ 	github.com/containerd/platforms v0.2.1 // indirect
+ 	github.com/containerd/stargz-snapshotter/estargz v0.18.2 // indirect
+-	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
++	github.com/coreos/go-oidc/v3 v3.17.0
+ 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
+ 	github.com/crewjam/httperr v0.2.0 // indirect
+ 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
+diff --git a/lib/auth/apiserver.go b/lib/auth/apiserver.go
+index 13f25c1ac6..9e2584f886 100644
+--- a/lib/auth/apiserver.go
++++ b/lib/auth/apiserver.go
+@@ -156,6 +156,7 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
+ 
+ 	// SSO validation handlers
+ 	srv.POST("/:version/github/requests/validate", srv.WithAuth(srv.validateGithubAuthCallback))
++	srv.POST("/:version/oidc/requests/validate", srv.WithAuth(srv.validateOIDCAuthCallback))
+ 
+ 	// Migrated/deleted endpoints with 501 Not Implemented handlers.
+ 	srv.POST("/:version/reversetunnels", httpMigratedHandler)
+@@ -550,6 +551,51 @@ func (s *APIServer) validateGithubAuthCallback(auth *ServerWithRoles, w http.Res
+ 	return &raw, nil
+ }
+ 
++/*
++validateOIDCAuthCallback validates OIDC auth callback redirect
++
++	POST /:version/oidc/requests/validate
++
++	Success response: authclient.OIDCAuthRawResponse
++*/
++func (s *APIServer) validateOIDCAuthCallback(auth *ServerWithRoles, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
++	var req authclient.ValidateOIDCAuthCallbackReq
++	if err := httplib.ReadJSON(r, &req); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	response, err := auth.ValidateOIDCAuthCallback(r.Context(), req.Query)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	raw := authclient.OIDCAuthRawResponse{
++		Username:      response.Username,
++		Identity:      response.Identity,
++		Cert:          response.Cert,
++		TLSCert:       response.TLSCert,
++		Req:           response.Req,
++		MFAToken:      response.MFAToken,
++		ClientOptions: response.ClientOptions,
++	}
++	if response.Session != nil {
++		rawSession, err := services.MarshalWebSession(
++			response.Session, services.WithVersion(version), services.PreserveRevision())
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		raw.Session = rawSession
++	}
++	raw.HostSigners = make([]json.RawMessage, len(response.HostSigners))
++	for i, ca := range response.HostSigners {
++		data, err := services.MarshalCertAuthority(
++			ca, services.WithVersion(version), services.PreserveRevision())
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		raw.HostSigners[i] = data
++	}
++	return &raw, nil
++}
++
+ func (*APIServer) getNamespaces(*ServerWithRoles, http.ResponseWriter, *http.Request, httprouter.Params, string) (any, error) {
+ 	return []types.Namespace{{
+ 		Kind:    types.KindNamespace,
+diff --git a/lib/auth/auth_with_roles.go b/lib/auth/auth_with_roles.go
+index 66b5ad3039..c9386d9d7c 100644
+--- a/lib/auth/auth_with_roles.go
++++ b/lib/auth/auth_with_roles.go
+@@ -4189,7 +4189,8 @@ func (a *ServerWithRoles) UpsertOIDCConnector(ctx context.Context, connector typ
+ 	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
++	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled &&
++		connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
+ 		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+ 		// we can't currently propagate wrapped errors across the gRPC boundary,
+ 		// and we want tctl to display a clean user-facing message in this case
+@@ -4210,7 +4211,8 @@ func (a *ServerWithRoles) UpdateOIDCConnector(ctx context.Context, connector typ
+ 	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
++	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled &&
++		connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
+ 		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+ 		// we can't currently propagate wrapped errors across the gRPC boundary,
+ 		// and we want tctl to display a clean user-facing message in this case
+@@ -4230,7 +4232,8 @@ func (a *ServerWithRoles) CreateOIDCConnector(ctx context.Context, connector typ
+ 	if err := a.authConnectorAction(types.KindOIDC, types.VerbCreate); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
++	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled &&
++		connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
+ 		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+ 		// we can't currently propagate wrapped errors across the gRPC boundary,
+ 		// and we want tctl to display a clean user-facing message in this case
+@@ -4293,10 +4296,15 @@ func (a *ServerWithRoles) ListOIDCConnectors(ctx context.Context, limit int, sta
+ 
+ func (a *ServerWithRoles) CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest) (*types.OIDCAuthRequest, error) {
+ 	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
+-		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+-		// we can't currently propagate wrapped errors across the gRPC boundary,
+-		// and we want tctl to display a clean user-facing message in this case
+-		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
++		// VinCSS OIDC connectors are served by the OSS implementation and
++		// do not require the Enterprise OIDC entitlement.
++		connector, err := a.authServer.GetOIDCConnector(ctx, req.ConnectorID, false)
++		if err != nil || connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
++			// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
++			// we can't currently propagate wrapped errors across the gRPC boundary,
++			// and we want tctl to display a clean user-facing message in this case
++			return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
++		}
+ 	}
+ 
+ 	if err := a.authorizeAction(types.KindOIDCRequest, types.VerbCreate); err != nil {
+diff --git a/lib/auth/export_test.go b/lib/auth/export_test.go
+index f1f36b0d70..65949ae763 100644
+--- a/lib/auth/export_test.go
++++ b/lib/auth/export_test.go
+@@ -313,6 +313,18 @@ func PopulateGithubClaims(user *GithubUserResponse, teams []GithubTeamResponse)
+ 	return populateGithubClaims(user, teams)
+ }
+ 
++func MatchOIDCClaims(mappings []types.ClaimMapping, claims map[string]any) []string {
++	return matchOIDCClaims(mappings, claims)
++}
++
++func ClaimsToTraits(claims map[string]any) map[string][]string {
++	return claimsToTraits(claims)
++}
++
++func PickOIDCUsername(claims map[string]any, sub string) string {
++	return pickOIDCUsername(claims, sub)
++}
++
+ func ValidateGithubAuthCallbackHelper(ctx context.Context, m GitHubManager, diagCtx *SSODiagContext, q url.Values, emitter apievents.Emitter, logger *slog.Logger) (*authclient.GithubAuthResponse, error) {
+ 	return validateGithubAuthCallbackHelper(ctx, m, diagCtx, q, emitter, logger)
+ }
+diff --git a/lib/auth/github.go b/lib/auth/github.go
+index 28ccfbded6..0d911cc9b4 100644
+--- a/lib/auth/github.go
++++ b/lib/auth/github.go
+@@ -27,6 +27,7 @@ import (
+ 	"log/slog"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -180,7 +181,7 @@ func (a *Server) CreateGithubAuthRequest(ctx context.Context, req types.GithubAu
+ 
+ // upsertGithubConnector creates or updates a Github connector.
+ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 	upserted, err := a.UpsertGithubConnector(ctx, connector)
+@@ -206,7 +207,7 @@ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // createGithubConnector creates a new Github connector.
+ func (a *Server) createGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 
+@@ -233,7 +234,7 @@ func (a *Server) createGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // updateGithubConnector updates an existing Github connector.
+ func (a *Server) updateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 	updated, err := a.UpdateGithubConnector(ctx, connector)
+@@ -269,9 +270,14 @@ type httpRequester interface {
+ // If userTeams is not nil, only organizations that are both specified
+ // in conn and in userTeams will be checked. If client is nil a
+ // net/http.Client will be used.
+-func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, orgCache *utils.FnCache, client httpRequester) error {
+-	version := modules.GetModules().BuildType()
+-	if version == modules.BuildEnterprise {
++func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, buildType string, orgCache *utils.FnCache, client httpRequester) error {
++	if buildType == modules.BuildEnterprise {
++		return nil
++	}
++	// The /orgs/<org>/sso probe below is github.com-specific. VinCSS targets
++	// a different OAuth2 provider that does not expose that endpoint, so
++	// skip the check entirely for the VinCSS sub-kind.
++	if conn.GetSubKind() == types.GithubConnectorSubKindVinCSS {
+ 		return nil
+ 	}
+ 
+@@ -341,7 +347,7 @@ func orgUsesExternalSSO(ctx context.Context, endpointURL, org string, client htt
+ 
+ 	const retries = 3
+ 	var resp *http.Response
+-	for i := 0; i < retries; i++ {
++	for i := range retries {
+ 		var err error
+ 		var urlErr *url.Error
+ 
+@@ -522,15 +528,32 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
+ 	return connector, nil
+ }
+ 
++// pathForSubKind returns the path to use for a SubKind-specific endpoint.
++// For VinCSS connectors the env override wins, then the VinCSS default;
++// for GitHub the github default is returned unchanged.
++func pathForSubKind(subKind, envVar, vinCSSDefault, githubDefault string) string {
++	if subKind == types.GithubConnectorSubKindVinCSS {
++		if p := os.Getenv(envVar); p != "" {
++			return p
++		}
++		return vinCSSDefault
++	}
++	return githubDefault
++}
++
+ func newGithubOAuth2Config(connector types.GithubConnector) oauth2.Config {
++	authPath := pathForSubKind(connector.GetSubKind(),
++		types.EnvVinCSSAuthPath, types.VinCSSAuthPath, GithubAuthPath)
++	tokenPath := pathForSubKind(connector.GetSubKind(),
++		types.EnvVinCSSTokenPath, types.VinCSSTokenPath, GithubTokenPath)
+ 	return oauth2.Config{
+ 		ClientID:     connector.GetClientID(),
+ 		ClientSecret: connector.GetClientSecret(),
+ 		RedirectURL:  connector.GetRedirectURL(),
+ 		Scopes:       GithubScopes,
+ 		Endpoint: oauth2.Endpoint{
+-			AuthURL:  fmt.Sprintf("%s/%s", connector.GetEndpointURL(), GithubAuthPath),
+-			TokenURL: fmt.Sprintf("%s/%s", connector.GetEndpointURL(), GithubTokenPath),
++			AuthURL:  fmt.Sprintf("%s/%s", connector.GetEndpointURL(), authPath),
++			TokenURL: fmt.Sprintf("%s/%s", connector.GetEndpointURL(), tokenPath),
+ 		},
+ 	}
+ }
+@@ -777,6 +800,7 @@ func (a *Server) getGitHubAPIClient(
+ 		token:       token.AccessToken,
+ 		authServer:  a,
+ 		apiEndpoint: apiEndpoint,
++		subKind:     connector.GetSubKind(),
+ 	}, nil
+ }
+ 
+@@ -798,6 +822,15 @@ func (a *Server) getGithubUserAndTeams(
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 
++	if connector.GetSubKind() == types.GithubConnectorSubKindVinCSS {
++		userResp, teamsResp, err := ghClient.getVinCSSIdentity()
++		if err != nil {
++			return nil, nil, trace.Wrap(err, "failed to query VinCSS user info")
++		}
++		logger.DebugContext(ctx, "Retrieved teleportGroup for VinCSS user.", "num_groups", len(teamsResp), "vincss_user", userResp.Login)
++		return userResp, teamsResp, nil
++	}
++
+ 	userResp, err := ghClient.getUser()
+ 	if err != nil {
+ 		return nil, nil, trace.Wrap(err, "failed to query GitHub user info")
+@@ -814,7 +847,7 @@ func (a *Server) getGithubUserAndTeams(
+ 	// This is checked when Github auth connectors get created or updated, but
+ 	// check again here in case the organization enabled external SSO after
+ 	// the auth connector was created.
+-	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 
+@@ -1019,27 +1052,6 @@ func (a *Server) createGithubUser(ctx context.Context, p *CreateUserParams, dryR
+ 	return user, nil
+ }
+ 
+-// ValidateClientRedirect checks a desktop client redirect URL for SSO logins
+-// against some (potentially nil) settings from an auth connector; in the
+-// current implementation, that means either "http" schema with a hostname of
+-// "localhost", "127.0.0.1", or "::1" and a path of "/callback" (with any port),
+-// or "https" schema with a hostname that matches one in the https_hostname
+-// list, a path of "/callback" and either an empty port or explicitly 443. The
+-// settings are ignored and only localhost URLs are allowed if we're using an
+-// ephemeral connector (in the SSO testing flow). If the insecure_allowed_cidr_ranges
+-// list is non-empty URLs in both the "http" and "https" schema are allowed
+-// if the hostname is an IP address that is contained in a specified CIDR
+-// range on any port.
+-//
+-// TODO(Joerger): Replaced by [sso.ValidateClientRedirect], remove once /e no longer depends on it
+-func ValidateClientRedirect(clientRedirect string, ssoTestFlow bool, settings *types.SSOClientRedirectSettings) error {
+-	ceremonyType := sso.CeremonyTypeLogin
+-	if ssoTestFlow {
+-		ceremonyType = sso.CeremonyTypeTest
+-	}
+-	return sso.ValidateClientRedirect(clientRedirect, ceremonyType, settings)
+-}
+-
+ // populateGithubClaims builds a GithubClaims using queried
+ // user, organization and teams information.
+ func populateGithubClaims(user *GithubUserResponse, teams []GithubTeamResponse) (*types.GithubClaims, error) {
+@@ -1071,6 +1083,9 @@ type githubAPIClient struct {
+ 	// apiEndpoint is the API endpoint of the Github instance
+ 	// to connect to.
+ 	apiEndpoint string
++	// subKind is the connector sub-kind (e.g. "vincss") used to pick the
++	// right API paths and response shapes. Empty for github.com.
++	subKind string
+ }
+ 
+ // GithubUserResponse represents response from "user" API call
+@@ -1079,12 +1094,38 @@ type GithubUserResponse struct {
+ 	Login string `json:"login"`
+ 	// ID is the user ID
+ 	ID int64 `json:"id"`
++
++	// idOverride is a string user identifier used by providers (like VinCSS)
++	// that do not return integer IDs. When non-empty it is returned by
++	// getIDStr instead of ID.
++	idOverride string
+ }
+ 
+ func (r GithubUserResponse) getIDStr() string {
++	if r.idOverride != "" {
++		return r.idOverride
++	}
+ 	return fmt.Sprintf("%v", r.ID)
+ }
+ 
++// VinCSSUserResponse is the VinCSS user-info API response. VinCSS returns a
++// string user identifier rather than GitHub's int64 ID, and embeds the
++// user's group/team membership directly under teleportGroup (no separate
++// teams endpoint). Adjust the JSON tags to match the deployed VinCSS API
++// shape.
++type VinCSSUserResponse struct {
++	Username      string   `json:"username"`
++	UserID        string   `json:"user_id"`
++	TeleportGroup []string `json:"teleportGroup"`
++}
++
++func (v VinCSSUserResponse) toGithubUserResponse() *GithubUserResponse {
++	return &GithubUserResponse{
++		Login:      v.Username,
++		idOverride: v.UserID,
++	}
++}
++
+ func (r GithubUserResponse) makeExternalIdentity(connectorID string) types.ExternalIdentity {
+ 	return types.ExternalIdentity{
+ 		ConnectorID: connectorID,
+@@ -1108,6 +1149,32 @@ func (c *githubAPIClient) getUser() (*GithubUserResponse, error) {
+ 	return &user, nil
+ }
+ 
++// getVinCSSIdentity fetches the user profile from the VinCSS user-info API
++// and synthesizes the team membership from the user-response teleportGroup
++// field. VinCSS does not expose a separate teams endpoint, so all groups are
++// mapped under the VinCSSOrganization synthetic organization.
++func (c *githubAPIClient) getVinCSSIdentity() (*GithubUserResponse, []GithubTeamResponse, error) {
++	userPath := pathForSubKind(c.subKind,
++		types.EnvVinCSSUserPath, types.VinCSSUserPath, "user")
++	bytes, _, err := c.get(userPath)
++	if err != nil {
++		return nil, nil, trace.Wrap(err)
++	}
++	var v VinCSSUserResponse
++	if err := json.Unmarshal(bytes, &v); err != nil {
++		return nil, nil, trace.Wrap(err)
++	}
++	teams := make([]GithubTeamResponse, 0, len(v.TeleportGroup))
++	for _, g := range v.TeleportGroup {
++		teams = append(teams, GithubTeamResponse{
++			Name: g,
++			Slug: g,
++			Org:  GithubOrgResponse{Login: types.VinCSSOrganization},
++		})
++	}
++	return v.toGithubUserResponse(), teams, nil
++}
++
+ // GithubTeamResponse represents a single team entry in the "teams" API response
+ type GithubTeamResponse struct {
+ 	// Name is the team name
+diff --git a/lib/auth/oidc.go b/lib/auth/oidc.go
+index 00557fddd5..3520c40fe7 100644
+--- a/lib/auth/oidc.go
++++ b/lib/auth/oidc.go
+@@ -126,8 +126,13 @@ func (a *Server) DeleteOIDCConnector(ctx context.Context, connectorName string)
+ }
+ 
+ // CreateOIDCAuthRequest delegates the method call to the oidcAuthService if present,
+-// or returns a NotImplemented error if not present.
++// or returns a NotImplemented error if not present. VinCSS sub-kind connectors
++// are handled by the in-tree OSS implementation regardless of whether an
++// enterprise OIDC service is registered.
+ func (a *Server) CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest) (*types.OIDCAuthRequest, error) {
++	if connector, ok := a.lookupVinCSSOIDCConnector(ctx, req); ok {
++		return a.createVinCSSOIDCAuthRequest(ctx, req, connector)
++	}
+ 	if a.oidcAuthService == nil {
+ 		return nil, errOIDCNotImplemented
+ 	}
+@@ -139,6 +144,10 @@ func (a *Server) CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRe
+ // CreateOIDCAuthRequestForMFA delegates the method call to the oidcAuthService if present,
+ // or returns a NotImplemented error if not present.
+ func (a *Server) CreateOIDCAuthRequestForMFA(ctx context.Context, req types.OIDCAuthRequest) (*types.OIDCAuthRequest, error) {
++	if connector, ok := a.lookupVinCSSOIDCConnector(ctx, req); ok {
++		// SSO MFA over VinCSS OIDC uses the same authorize flow.
++		return a.createVinCSSOIDCAuthRequest(ctx, req, connector)
++	}
+ 	if a.oidcAuthService == nil {
+ 		return nil, errOIDCNotImplemented
+ 	}
+@@ -148,8 +157,18 @@ func (a *Server) CreateOIDCAuthRequestForMFA(ctx context.Context, req types.OIDC
+ }
+ 
+ // ValidateOIDCAuthCallback delegates the method call to the oidcAuthService if present,
+-// or returns a NotImplemented error if not present.
++// or returns a NotImplemented error if not present. The callback dispatcher
++// inspects the stored auth request to detect VinCSS sub-kind connectors and
++// routes those to the in-tree OSS implementation.
+ func (a *Server) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
++	if state := q.Get("state"); state != "" {
++		if req, err := a.Services.GetOIDCAuthRequest(ctx, state); err == nil {
++			if connector, err := a.GetOIDCConnector(ctx, req.ConnectorID, false); err == nil &&
++				connector.GetSubKind() == types.OIDCConnectorSubKindVinCSS {
++				return a.validateVinCSSOIDCAuthCallback(ctx, q)
++			}
++		}
++	}
+ 	if a.oidcAuthService == nil {
+ 		return nil, errOIDCNotImplemented
+ 	}
+@@ -157,3 +176,30 @@ func (a *Server) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*a
+ 	resp, err := a.oidcAuthService.ValidateOIDCAuthCallback(ctx, q)
+ 	return resp, trace.Wrap(err)
+ }
++
++// lookupVinCSSOIDCConnector resolves the OIDC connector referenced by the
++// given auth request and reports whether it is a VinCSS sub-kind. The
++// resolved connector (with secrets) is returned for reuse by the caller.
++// For the SSO test flow the connector spec is embedded in the request and the
++// sub-kind is implied.
++func (a *Server) lookupVinCSSOIDCConnector(ctx context.Context, req types.OIDCAuthRequest) (types.OIDCConnector, bool) {
++	if req.SSOTestFlow && req.ConnectorSpec != nil {
++		c, err := types.NewOIDCConnector(req.ConnectorID, *req.ConnectorSpec)
++		if err != nil {
++			return nil, false
++		}
++		c.SetSubKind(types.OIDCConnectorSubKindVinCSS)
++		return c, true
++	}
++	if req.ConnectorID == "" {
++		return nil, false
++	}
++	connector, err := a.GetOIDCConnector(ctx, req.ConnectorID, true)
++	if err != nil {
++		return nil, false
++	}
++	if connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
++		return nil, false
++	}
++	return connector, true
++}
+diff --git a/lib/auth/oidc_vincss.go b/lib/auth/oidc_vincss.go
+new file mode 100644
+index 0000000000..4f6a978a6f
+--- /dev/null
++++ b/lib/auth/oidc_vincss.go
+@@ -0,0 +1,536 @@
++/*
++ * Teleport
++ * Copyright (C) 2025  Gravitational, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// oidc_vincss.go implements the OIDC authorization-code flow with PKCE for
++// OIDCConnectors whose SubKind is types.OIDCConnectorSubKindVinCSS. It is the
++// OSS counterpart to the enterprise OIDC service registered via
++// Server.SetOIDCService and is reached when no enterprise OIDC service is
++// registered.
++
++package auth
++
++import (
++	"context"
++	"net/url"
++	"slices"
++	"time"
++
++	coreoidc "github.com/coreos/go-oidc/v3/oidc"
++	"github.com/gravitational/trace"
++	"golang.org/x/oauth2"
++
++	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/api/constants"
++	apidefaults "github.com/gravitational/teleport/api/defaults"
++	"github.com/gravitational/teleport/api/types"
++	apievents "github.com/gravitational/teleport/api/types/events"
++	apiutils "github.com/gravitational/teleport/api/utils"
++	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
++	"github.com/gravitational/teleport/lib/auth/authclient"
++	"github.com/gravitational/teleport/lib/authz"
++	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/events"
++	"github.com/gravitational/teleport/lib/loginrule"
++	"github.com/gravitational/teleport/lib/services"
++	"github.com/gravitational/teleport/lib/utils"
++)
++
++// vinCSSDefaultScopes is appended to the connector spec scopes if they do not
++// already include openid. profile/email/groups are requested as a best-effort
++// default; the connector can override the full list via spec.scope.
++var vinCSSDefaultScopes = []string{coreoidc.ScopeOpenID, "email", "profile", "groups"}
++
++// createVinCSSOIDCAuthRequest creates a new OIDC authorization request for a
++// VinCSS sub-kind connector. It performs OIDC discovery against the issuer
++// URL, computes the authorize URL with PKCE, persists the request, and
++// returns the populated request to the caller.
++func (a *Server) createVinCSSOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest, connector types.OIDCConnector) (*types.OIDCAuthRequest, error) {
++	cfg, _, err := newVinCSSOIDCConfig(ctx, connector, req.ProxyAddress)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	stateToken, err := utils.CryptoRandomHex(defaults.TokenLenBytes)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	req.StateToken = stateToken
++
++	verifier := oauth2.GenerateVerifier()
++	req.PkceVerifier = verifier
++
++	req.RedirectURL = cfg.AuthCodeURL(stateToken, oauth2.S256ChallengeOption(verifier))
++
++	if err := a.Services.CreateOIDCAuthRequest(ctx, req, defaults.OIDCAuthRequestTTL); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	a.logger.DebugContext(ctx, "Created VinCSS OIDC auth request",
++		"connector", connector.GetName(), "redirect_url", req.RedirectURL)
++	return &req, nil
++}
++
++// validateVinCSSOIDCAuthCallback validates the callback parameters returned
++// from the VinCSS OIDC provider, exchanges the authorization code for tokens,
++// verifies the ID token, maps claims to roles, creates or updates the user,
++// and returns the OIDC auth response.
++func (a *Server) validateVinCSSOIDCAuthCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
++	logger := a.logger.With(teleport.ComponentKey, "vincss-oidc")
++	diagCtx := NewSSODiagContext(types.KindOIDC, a)
++
++	if errParam := q.Get("error"); errParam != "" {
++		state := q.Get("state")
++		if state != "" {
++			diagCtx.RequestID = state
++			if r, err := a.Services.GetOIDCAuthRequest(ctx, state); err == nil {
++				diagCtx.Info.TestFlow = r.SSOTestFlow
++			}
++		}
++		oauthErr := trace.OAuth2("invalid_request", errParam, q)
++		return nil, trace.WithUserMessage(oauthErr, "VinCSS OIDC returned error: %v [%v]",
++			q.Get("error_description"), errParam)
++	}
++
++	code := q.Get("code")
++	if code == "" {
++		oauthErr := trace.OAuth2("invalid_request", "code query param must be set", q)
++		return nil, trace.WithUserMessage(oauthErr, "Invalid parameters received from VinCSS OIDC.")
++	}
++	stateToken := q.Get("state")
++	if stateToken == "" {
++		oauthErr := trace.OAuth2("invalid_request", "missing state query param", q)
++		return nil, trace.WithUserMessage(oauthErr, "Invalid parameters received from VinCSS OIDC.")
++	}
++	diagCtx.RequestID = stateToken
++
++	req, err := a.Services.GetOIDCAuthRequest(ctx, stateToken)
++	if err != nil {
++		return nil, trace.Wrap(err, "Failed to get VinCSS OIDC auth request.")
++	}
++	diagCtx.Info.TestFlow = req.SSOTestFlow
++
++	connector, err := a.getVinCSSOIDCConnector(ctx, *req)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	cfg, provider, err := newVinCSSOIDCConfig(ctx, connector, req.ProxyAddress)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	token, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(req.PkceVerifier))
++	if err != nil {
++		return nil, trace.Wrap(err, "Failed to exchange VinCSS OIDC authorization code.")
++	}
++
++	rawIDToken, ok := token.Extra("id_token").(string)
++	if !ok || rawIDToken == "" {
++		return nil, trace.BadParameter("VinCSS OIDC token response did not include an id_token")
++	}
++
++	verifier := provider.Verifier(&coreoidc.Config{ClientID: connector.GetClientID()})
++	idToken, err := verifier.Verify(ctx, rawIDToken)
++	if err != nil {
++		return nil, trace.Wrap(err, "Failed to verify VinCSS OIDC ID token.")
++	}
++
++	claims := map[string]any{}
++	if err := idToken.Claims(&claims); err != nil {
++		return nil, trace.Wrap(err, "Failed to parse VinCSS OIDC ID token claims.")
++	}
++	diagCtx.Info.OIDCClaims = types.OIDCClaims(claims)
++	logger.DebugContext(ctx, "VinCSS OIDC ID token verified",
++		"subject", idToken.Subject, "claim_keys", claimKeys(claims))
++
++	username := pickOIDCUsername(claims, idToken.Subject)
++	if username == "" {
++		return nil, trace.BadParameter("VinCSS OIDC claims do not contain a username")
++	}
++
++	params, err := a.calculateVinCSSOIDCUser(ctx, diagCtx, connector, claims, username, idToken.Subject, req)
++	if err != nil {
++		return nil, trace.Wrap(err, "Failed to calculate user attributes from VinCSS OIDC claims.")
++	}
++	diagCtx.Info.CreateUserParams = &types.CreateUserParams{
++		ConnectorName: params.ConnectorName,
++		Username:      params.Username,
++		KubeGroups:    params.KubeGroups,
++		KubeUsers:     params.KubeUsers,
++		Roles:         params.Roles,
++		Traits:        params.Traits,
++		SessionTTL:    types.Duration(params.SessionTTL),
++	}
++
++	user, err := a.createVinCSSOIDCUser(ctx, params, req.SSOTestFlow)
++	if err != nil {
++		return nil, trace.Wrap(err, "Failed to create user from VinCSS OIDC claims.")
++	}
++
++	if err := a.CallLoginHooks(ctx, user); err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	userState, err := a.GetUserOrLoginState(ctx, user.GetName())
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++
++	identity := types.ExternalIdentity{
++		ConnectorID: connector.GetName(),
++		Username:    params.Username,
++		UserID:      idToken.Subject,
++	}
++	auth := &authclient.OIDCAuthResponse{
++		Req:      oidcAuthRequestToAuthclient(req),
++		Identity: identity,
++		Username: params.Username,
++	}
++
++	// Emit successful login event.
++	a.emitOIDCLoginSuccess(ctx, diagCtx, params.Username)
++
++	if req.SSOTestFlow {
++		diagCtx.Info.Success = true
++		diagCtx.WriteToBackend(ctx)
++		return auth, nil
++	}
++	diagCtx.WriteToBackend(ctx)
++
++	if req.CreateWebSession {
++		session, err := a.CreateWebSessionFromReq(ctx, NewWebSessionRequest{
++			User:                 userState.GetName(),
++			Roles:                userState.GetRoles(),
++			Traits:               userState.GetTraits(),
++			SessionTTL:           params.SessionTTL,
++			LoginTime:            a.clock.Now().UTC(),
++			LoginIP:              req.ClientLoginIP,
++			LoginUserAgent:       req.ClientUserAgent,
++			AttestWebSession:     true,
++			CreateDeviceWebToken: true,
++		})
++		if err != nil {
++			return nil, trace.Wrap(err, "Failed to create web session.")
++		}
++		auth.Session = session
++	}
++
++	if len(req.SshPublicKey) != 0 || len(req.TlsPublicKey) != 0 {
++		sshCert, tlsCert, err := a.CreateSessionCerts(ctx, &SessionCertsRequest{
++			UserState:               userState,
++			SessionTTL:              params.SessionTTL,
++			SSHPubKey:               req.SshPublicKey,
++			TLSPubKey:               req.TlsPublicKey,
++			SSHAttestationStatement: hardwarekey.AttestationStatementFromProto(req.SshAttestationStatement),
++			TLSAttestationStatement: hardwarekey.AttestationStatementFromProto(req.TlsAttestationStatement),
++			Compatibility:           req.Compatibility,
++			RouteToCluster:          req.RouteToCluster,
++			KubernetesCluster:       req.KubernetesCluster,
++			LoginIP:                 req.ClientLoginIP,
++		})
++		if err != nil {
++			return nil, trace.Wrap(err, "Failed to create session certificate.")
++		}
++		clusterName, err := a.GetClusterName(ctx)
++		if err != nil {
++			return nil, trace.Wrap(err, "Failed to obtain cluster name.")
++		}
++		auth.Cert = sshCert
++		auth.TLSCert = tlsCert
++		authority, err := a.GetCertAuthority(ctx, types.CertAuthID{
++			Type:       types.HostCA,
++			DomainName: clusterName.GetClusterName(),
++		}, false)
++		if err != nil {
++			return nil, trace.Wrap(err, "Failed to obtain cluster's host CA.")
++		}
++		auth.HostSigners = append(auth.HostSigners, authority)
++	}
++	if o, err := a.ClientOptionsForLogin(userState); err == nil {
++		auth.ClientOptions = o
++	}
++	return auth, nil
++}
++
++// newVinCSSOIDCConfig performs OIDC discovery against the connector's issuer
++// URL and returns an oauth2.Config (with provider endpoints filled in) and the
++// underlying coreoidc.Provider for ID token verification.
++func newVinCSSOIDCConfig(ctx context.Context, connector types.OIDCConnector, proxyAddress string) (*oauth2.Config, *coreoidc.Provider, error) {
++	provider, err := coreoidc.NewProvider(ctx, connector.GetIssuerURL())
++	if err != nil {
++		return nil, nil, trace.Wrap(err, "VinCSS OIDC discovery failed for %q", connector.GetIssuerURL())
++	}
++	redirectURL, err := services.GetRedirectURL(connector, proxyAddress)
++	if err != nil {
++		return nil, nil, trace.Wrap(err)
++	}
++	scopes := connector.GetScope()
++	if len(scopes) == 0 {
++		scopes = append(scopes, vinCSSDefaultScopes...)
++	} else if !slices.Contains(scopes, coreoidc.ScopeOpenID) {
++		scopes = append([]string{coreoidc.ScopeOpenID}, scopes...)
++	}
++	cfg := &oauth2.Config{
++		ClientID:     connector.GetClientID(),
++		ClientSecret: connector.GetClientSecret(),
++		RedirectURL:  redirectURL,
++		Endpoint:     provider.Endpoint(),
++		Scopes:       scopes,
++	}
++	return cfg, provider, nil
++}
++
++// getVinCSSOIDCConnector returns the connector referenced by the given auth
++// request, honoring SSOTestFlow (stateless connector spec).
++func (a *Server) getVinCSSOIDCConnector(ctx context.Context, req types.OIDCAuthRequest) (types.OIDCConnector, error) {
++	if req.SSOTestFlow {
++		if req.ConnectorSpec == nil {
++			return nil, trace.BadParameter("ConnectorSpec cannot be nil for SSOTestFlow")
++		}
++		if req.ConnectorID == "" {
++			return nil, trace.BadParameter("ConnectorID cannot be empty")
++		}
++		c, err := types.NewOIDCConnector(req.ConnectorID, *req.ConnectorSpec)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		c.SetSubKind(types.OIDCConnectorSubKindVinCSS)
++		return c, nil
++	}
++	connector, err := a.GetOIDCConnector(ctx, req.ConnectorID, true)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	if connector.GetSubKind() != types.OIDCConnectorSubKindVinCSS {
++		return nil, trace.BadParameter("connector %q is not a VinCSS OIDC connector", req.ConnectorID)
++	}
++	return connector, nil
++}
++
++// pickOIDCUsername returns the preferred username from a claim set. It tries
++// preferred_username, email, then sub.
++func pickOIDCUsername(claims map[string]any, sub string) string {
++	for _, key := range []string{"preferred_username", "email", "username"} {
++		if v, ok := claims[key].(string); ok && v != "" {
++			return v
++		}
++	}
++	return sub
++}
++
++// claimsToTraits flattens an OIDC claim set into the trait map shape used by
++// Teleport's role/login-rule machinery. Scalar string/number/bool claims
++// become single-element slices; arrays of those types become multi-element
++// slices; everything else is skipped.
++func claimsToTraits(claims map[string]any) map[string][]string {
++	traits := make(map[string][]string, len(claims))
++	for k, v := range claims {
++		switch t := v.(type) {
++		case string:
++			traits[k] = []string{t}
++		case []any:
++			for _, item := range t {
++				if s, ok := item.(string); ok {
++					traits[k] = append(traits[k], s)
++				}
++			}
++		case bool:
++			if t {
++				traits[k] = []string{"true"}
++			} else {
++				traits[k] = []string{"false"}
++			}
++		}
++	}
++	return traits
++}
++
++func claimKeys(claims map[string]any) []string {
++	out := make([]string, 0, len(claims))
++	for k := range claims {
++		out = append(out, k)
++	}
++	slices.Sort(out)
++	return out
++}
++
++// matchOIDCClaims walks claims_to_roles, picking up every role whose claim
++// matches the user's claims. Match semantics: equal string, or membership in
++// the value array.
++func matchOIDCClaims(mappings []types.ClaimMapping, claims map[string]any) []string {
++	var roles []string
++	for _, m := range mappings {
++		v, ok := claims[m.Claim]
++		if !ok {
++			continue
++		}
++		switch t := v.(type) {
++		case string:
++			if t == m.Value {
++				roles = append(roles, m.Roles...)
++			}
++		case []any:
++			for _, item := range t {
++				if s, ok := item.(string); ok && s == m.Value {
++					roles = append(roles, m.Roles...)
++					break
++				}
++			}
++		}
++	}
++	return apiutils.Deduplicate(roles)
++}
++
++// calculateVinCSSOIDCUser turns verified OIDC claims into a CreateUserParams
++// using the connector's claims_to_roles mapping plus any configured login
++// rules.
++func (a *Server) calculateVinCSSOIDCUser(
++	ctx context.Context,
++	diagCtx *SSODiagContext,
++	connector types.OIDCConnector,
++	claims map[string]any,
++	username, userID string,
++	req *types.OIDCAuthRequest,
++) (*CreateUserParams, error) {
++	roles := matchOIDCClaims(connector.GetClaimsToRoles(), claims)
++	if len(roles) == 0 {
++		return nil, trace.AccessDenied("VinCSS OIDC user %q has no roles matched by claims_to_roles", username)
++	}
++
++	traits := claimsToTraits(claims)
++	traits[constants.TraitLogins] = []string{username}
++
++	eval, err := a.GetLoginRuleEvaluator().Evaluate(ctx, &loginrule.EvaluationInput{Traits: traits})
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	traits = eval.Traits
++	diagCtx.Info.AppliedLoginRules = eval.AppliedRules
++
++	fetched, err := services.FetchRolesWithContext(roles, a, services.RoleTemplateContext{
++		Username: username,
++		Traits:   traits,
++	})
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	sessionTTL := fetched.AdjustSessionTTL(apidefaults.MaxCertDuration)
++	if req.CertTTL > 0 {
++		sessionTTL = utils.MinTTL(sessionTTL, req.CertTTL)
++	}
++
++	return &CreateUserParams{
++		ConnectorName: connector.GetName(),
++		Username:      username,
++		UserID:        userID,
++		KubeGroups:    traits[constants.TraitKubeGroups],
++		KubeUsers:     traits[constants.TraitKubeUsers],
++		Roles:         roles,
++		Traits:        traits,
++		SessionTTL:    sessionTTL,
++	}, nil
++}
++
++// createVinCSSOIDCUser materializes a Teleport user record from the calculated
++// params. In dryRun (SSO test flow) it builds the user object without
++// persisting.
++func (a *Server) createVinCSSOIDCUser(ctx context.Context, p *CreateUserParams, dryRun bool) (types.User, error) {
++	expires := a.GetClock().Now().UTC().Add(p.SessionTTL)
++	user := &types.UserV2{
++		Kind:    types.KindUser,
++		Version: types.V2,
++		Metadata: types.Metadata{
++			Name:      p.Username,
++			Namespace: apidefaults.Namespace,
++			Expires:   &expires,
++		},
++		Spec: types.UserSpecV2{
++			Roles:  p.Roles,
++			Traits: p.Traits,
++			OIDCIdentities: []types.ExternalIdentity{{
++				ConnectorID: p.ConnectorName,
++				Username:    p.Username,
++				UserID:      p.UserID,
++			}},
++			CreatedBy: types.CreatedBy{
++				User: types.UserRef{Name: teleport.UserSystem},
++				Time: a.GetClock().Now().UTC(),
++				Connector: &types.ConnectorRef{
++					Type:     constants.OIDC,
++					ID:       p.ConnectorName,
++					Identity: p.Username,
++				},
++			},
++		},
++	}
++	if dryRun {
++		return user, nil
++	}
++	existing, err := a.Services.GetUser(ctx, p.Username, false)
++	if err != nil && !trace.IsNotFound(err) {
++		return nil, trace.Wrap(err)
++	}
++	if existing != nil {
++		if !user.GetCreatedBy().Connector.IsSameProvider(existing.GetCreatedBy().Connector) {
++			return nil, trace.AlreadyExists("local user %q already exists and was not created by VinCSS OIDC", existing.GetName())
++		}
++		user.SetRevision(existing.GetRevision())
++		if _, err := a.UpdateUser(ctx, user); err != nil {
++			return nil, trace.Wrap(err)
++		}
++		return user, nil
++	}
++	if _, err := a.CreateUser(ctx, user); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	return user, nil
++}
++
++// oidcAuthRequestToAuthclient extracts the public-facing OIDCAuthRequest used
++// in the authclient response from the wire-level types.OIDCAuthRequest.
++func oidcAuthRequestToAuthclient(req *types.OIDCAuthRequest) authclient.OIDCAuthRequest {
++	return authclient.OIDCAuthRequest{
++		ConnectorID:       req.ConnectorID,
++		CSRFToken:         req.CSRFToken,
++		SSHPubKey:         req.SshPublicKey,
++		TLSPubKey:         req.TlsPublicKey,
++		CreateWebSession:  req.CreateWebSession,
++		ClientRedirectURL: req.ClientRedirectURL,
++	}
++}
++
++// emitOIDCLoginSuccess emits a successful SSO user-login audit event.
++func (a *Server) emitOIDCLoginSuccess(ctx context.Context, diagCtx *SSODiagContext, username string) {
++	code := events.UserSSOLoginCode
++	if diagCtx.Info.TestFlow {
++		code = events.UserSSOTestFlowLoginCode
++	}
++	evt := &apievents.UserLogin{
++		Metadata: apievents.Metadata{
++			Type: events.UserLoginEvent,
++			Code: code,
++			Time: time.Now().UTC(),
++		},
++		Method:             events.LoginMethodOIDC,
++		UserMetadata:       apievents.UserMetadata{User: username},
++		ConnectionMetadata: authz.ConnectionMetadata(ctx),
++		Status:             apievents.Status{Success: true},
++	}
++	if err := a.emitter.EmitAuditEvent(ctx, evt); err != nil {
++		a.logger.WarnContext(ctx, "Failed to emit VinCSS OIDC login event", "error", err)
++	}
++}
+diff --git a/lib/auth/oidc_vincss_test.go b/lib/auth/oidc_vincss_test.go
+new file mode 100644
+index 0000000000..ef59383daf
+--- /dev/null
++++ b/lib/auth/oidc_vincss_test.go
+@@ -0,0 +1,346 @@
++/*
++ * Teleport
++ * Copyright (C) 2025  Gravitational, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package auth_test
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sync"
++	"testing"
++	"time"
++
++	jose "github.com/go-jose/go-jose/v4"
++	"github.com/stretchr/testify/require"
++
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/auth"
++)
++
++// fakeOIDCIdP is a small OIDC provider for VinCSS OIDC tests. It exposes
++// discovery, JWKS, and a token endpoint that mints an RSA-signed ID token
++// for a pre-issued authorization code.
++type fakeOIDCIdP struct {
++	*httptest.Server
++	t          *testing.T
++	privateKey *rsa.PrivateKey
++	keyID      string
++	clientID   string
++
++	mu    sync.Mutex
++	codes map[string]map[string]any // code -> claims to embed in ID token
++}
++
++func newFakeOIDCIdP(t *testing.T, clientID string) *fakeOIDCIdP {
++	t.Helper()
++	priv, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++
++	f := &fakeOIDCIdP{
++		t:          t,
++		privateKey: priv,
++		keyID:      "test-key-1",
++		clientID:   clientID,
++		codes:      map[string]map[string]any{},
++	}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/.well-known/openid-configuration", f.handleDiscovery)
++	mux.HandleFunc("/.well-known/jwks.json", f.handleJWKS)
++	mux.HandleFunc("/token", f.handleToken)
++	// /authorize is not required for these tests since the auth server does
++	// not call it; the browser does. Tests pre-issue a code via IssueCode.
++
++	f.Server = httptest.NewServer(mux)
++	t.Cleanup(f.Close)
++	return f
++}
++
++func (f *fakeOIDCIdP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
++	doc := map[string]any{
++		"issuer":                                f.URL,
++		"authorization_endpoint":                f.URL + "/authorize",
++		"token_endpoint":                        f.URL + "/token",
++		"jwks_uri":                              f.URL + "/.well-known/jwks.json",
++		"response_types_supported":              []string{"code"},
++		"subject_types_supported":               []string{"public"},
++		"id_token_signing_alg_values_supported": []string{"RS256"},
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(doc)
++}
++
++func (f *fakeOIDCIdP) handleJWKS(w http.ResponseWriter, _ *http.Request) {
++	jwk := jose.JSONWebKey{
++		Key:       &f.privateKey.PublicKey,
++		KeyID:     f.keyID,
++		Algorithm: string(jose.RS256),
++		Use:       "sig",
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}})
++}
++
++// IssueCode registers a one-shot authorization code that the token endpoint
++// will accept and exchange for an ID token containing the provided claims.
++func (f *fakeOIDCIdP) IssueCode(code string, claims map[string]any) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.codes[code] = claims
++}
++
++func (f *fakeOIDCIdP) handleToken(w http.ResponseWriter, r *http.Request) {
++	require.NoError(f.t, r.ParseForm())
++	code := r.FormValue("code")
++
++	f.mu.Lock()
++	claims, ok := f.codes[code]
++	if ok {
++		delete(f.codes, code)
++	}
++	f.mu.Unlock()
++	if !ok {
++		http.Error(w, "unknown code", http.StatusBadRequest)
++		return
++	}
++
++	now := time.Now()
++	idClaims := map[string]any{
++		"iss": f.URL,
++		"aud": f.clientID,
++		"sub": "user-sub-id",
++		"iat": now.Unix(),
++		"exp": now.Add(5 * time.Minute).Unix(),
++	}
++	for k, v := range claims {
++		idClaims[k] = v
++	}
++	idToken, err := f.signIDToken(idClaims)
++	require.NoError(f.t, err)
++
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]any{
++		"access_token": "fake-access-token",
++		"token_type":   "Bearer",
++		"id_token":     idToken,
++		"expires_in":   300,
++	})
++}
++
++func (f *fakeOIDCIdP) signIDToken(claims map[string]any) (string, error) {
++	signingKey := jose.SigningKey{
++		Algorithm: jose.RS256,
++		Key:       f.privateKey,
++	}
++	opts := (&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", f.keyID)
++	signer, err := jose.NewSigner(signingKey, opts)
++	if err != nil {
++		return "", err
++	}
++	payload, err := json.Marshal(claims)
++	if err != nil {
++		return "", err
++	}
++	jws, err := signer.Sign(payload)
++	if err != nil {
++		return "", err
++	}
++	return jws.CompactSerialize()
++}
++
++func newVinCSSOIDCConnector(t *testing.T, name, issuerURL, clientID, redirectURL string) types.OIDCConnector {
++	t.Helper()
++	connector, err := types.NewOIDCConnector(name, types.OIDCConnectorSpecV3{
++		IssuerURL:    issuerURL,
++		ClientID:     clientID,
++		ClientSecret: "test-secret",
++		RedirectURLs: []string{redirectURL},
++		Scope:        []string{"openid", "email", "groups"},
++		ClaimsToRoles: []types.ClaimMapping{
++			{Claim: "groups", Value: "admins", Roles: []string{"vincss-admin"}},
++		},
++	})
++	require.NoError(t, err)
++	connector.SetSubKind(types.OIDCConnectorSubKindVinCSS)
++	require.NoError(t, connector.CheckAndSetDefaults())
++	return connector
++}
++
++func TestVinCSSOIDCCreateAuthRequest(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	tt := setupGithubContext(ctx, t)
++
++	idp := newFakeOIDCIdP(t, "vincss-client")
++	connector := newVinCSSOIDCConnector(t, "vincss",
++		idp.URL, "vincss-client", "https://proxy.example.com/v1/webapi/oidc/callback")
++	_, err := tt.a.UpsertOIDCConnector(ctx, connector)
++	require.NoError(t, err)
++
++	req, err := tt.a.CreateOIDCAuthRequest(ctx, types.OIDCAuthRequest{
++		ConnectorID:      "vincss",
++		CreateWebSession: true,
++	})
++	require.NoError(t, err)
++	require.NotEmpty(t, req.StateToken, "state token must be generated")
++	require.NotEmpty(t, req.PkceVerifier, "PKCE verifier must be generated")
++	require.NotEmpty(t, req.RedirectURL, "authorize URL must be filled in")
++
++	u, err := url.Parse(req.RedirectURL)
++	require.NoError(t, err)
++	q := u.Query()
++	require.Equal(t, "vincss-client", q.Get("client_id"))
++	require.Equal(t, req.StateToken, q.Get("state"))
++	require.NotEmpty(t, q.Get("code_challenge"), "PKCE challenge must be on the URL")
++	require.Equal(t, "S256", q.Get("code_challenge_method"))
++}
++
++func TestVinCSSOIDCValidateCallback(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	tt := setupGithubContext(ctx, t)
++
++	role, err := types.NewRole("vincss-admin", types.RoleSpecV6{})
++	require.NoError(t, err)
++	_, err = tt.a.UpsertRole(ctx, role)
++	require.NoError(t, err)
++
++	idp := newFakeOIDCIdP(t, "vincss-client")
++	connector := newVinCSSOIDCConnector(t, "vincss",
++		idp.URL, "vincss-client", "https://proxy.example.com/v1/webapi/oidc/callback")
++	_, err = tt.a.UpsertOIDCConnector(ctx, connector)
++	require.NoError(t, err)
++
++	req, err := tt.a.CreateOIDCAuthRequest(ctx, types.OIDCAuthRequest{
++		ConnectorID: "vincss",
++	})
++	require.NoError(t, err)
++
++	const code = "fake-auth-code"
++	idp.IssueCode(code, map[string]any{
++		"preferred_username": "alice@vincss.test",
++		"email":              "alice@vincss.test",
++		"groups":             []any{"admins"},
++	})
++
++	resp, err := tt.a.ValidateOIDCAuthCallback(ctx, url.Values{
++		"state": {req.StateToken},
++		"code":  {code},
++	})
++	require.NoError(t, err)
++	require.Equal(t, "alice@vincss.test", resp.Username)
++	require.Equal(t, "vincss", resp.Identity.ConnectorID)
++	require.Equal(t, "user-sub-id", resp.Identity.UserID)
++
++	user, err := tt.a.GetUser(ctx, "alice@vincss.test", false)
++	require.NoError(t, err)
++	require.Contains(t, user.GetRoles(), "vincss-admin")
++}
++
++func TestVinCSSOIDCValidateCallbackRejectsUnmappedClaims(t *testing.T) {
++	t.Parallel()
++	ctx := context.Background()
++	tt := setupGithubContext(ctx, t)
++
++	idp := newFakeOIDCIdP(t, "vincss-client")
++	connector := newVinCSSOIDCConnector(t, "vincss",
++		idp.URL, "vincss-client", "https://proxy.example.com/v1/webapi/oidc/callback")
++	_, err := tt.a.UpsertOIDCConnector(ctx, connector)
++	require.NoError(t, err)
++
++	req, err := tt.a.CreateOIDCAuthRequest(ctx, types.OIDCAuthRequest{ConnectorID: "vincss"})
++	require.NoError(t, err)
++
++	const code = "code-no-match"
++	idp.IssueCode(code, map[string]any{
++		"preferred_username": "bob@vincss.test",
++		"groups":             []any{"contractors"},
++	})
++
++	_, err = tt.a.ValidateOIDCAuthCallback(ctx, url.Values{
++		"state": {req.StateToken},
++		"code":  {code},
++	})
++	require.Error(t, err, "callback must fail when no claim maps to a role")
++}
++
++func TestMatchOIDCClaims(t *testing.T) {
++	t.Parallel()
++	mappings := []types.ClaimMapping{
++		{Claim: "groups", Value: "admins", Roles: []string{"r-admin"}},
++		{Claim: "groups", Value: "devs", Roles: []string{"r-dev"}},
++		{Claim: "role", Value: "owner", Roles: []string{"r-owner"}},
++	}
++	tests := []struct {
++		name   string
++		claims map[string]any
++		want   []string
++	}{
++		{name: "string claim matches", claims: map[string]any{"role": "owner"}, want: []string{"r-owner"}},
++		{name: "array claim matches one", claims: map[string]any{"groups": []any{"admins"}}, want: []string{"r-admin"}},
++		{name: "array claim matches multiple mappings", claims: map[string]any{"groups": []any{"admins", "devs"}}, want: []string{"r-admin", "r-dev"}},
++		{name: "no match", claims: map[string]any{"groups": []any{"contractors"}}, want: nil},
++		{name: "wrong claim name", claims: map[string]any{"other": "admins"}, want: nil},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := auth.MatchOIDCClaims(mappings, tt.claims)
++			require.ElementsMatch(t, tt.want, got)
++		})
++	}
++}
++
++func TestClaimsToTraitsMapping(t *testing.T) {
++	t.Parallel()
++	got := auth.ClaimsToTraits(map[string]any{
++		"email":       "alice@vincss.test",
++		"groups":      []any{"admins", "devs"},
++		"is_internal": true,
++		"ignored":     map[string]any{"nested": "value"}, // unsupported -> skipped
++	})
++	require.Equal(t, []string{"alice@vincss.test"}, got["email"])
++	require.ElementsMatch(t, []string{"admins", "devs"}, got["groups"])
++	require.Equal(t, []string{"true"}, got["is_internal"])
++	_, hasIgnored := got["ignored"]
++	require.False(t, hasIgnored)
++}
++
++func TestPickOIDCUsername(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		name   string
++		claims map[string]any
++		sub    string
++		want   string
++	}{
++		{name: "preferred_username wins", claims: map[string]any{"preferred_username": "p", "email": "e", "username": "u"}, sub: "s", want: "p"},
++		{name: "fallback to email", claims: map[string]any{"email": "e"}, sub: "s", want: "e"},
++		{name: "fallback to username", claims: map[string]any{"username": "u"}, sub: "s", want: "u"},
++		{name: "fallback to sub", claims: map[string]any{}, sub: "s", want: "s"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.want, auth.PickOIDCUsername(tt.claims, tt.sub))
++		})
++	}
++}
+diff --git a/lib/services/github.go b/lib/services/github.go
+index 0444cc5f0b..83ee8ad991 100644
+--- a/lib/services/github.go
++++ b/lib/services/github.go
+@@ -178,10 +178,13 @@ func MarshalOSSGithubConnector(githubConnector types.GithubConnector, opts ...Ma
+ 
+ 		// Return an error for OSS build if the endpoint url is set, but it is
+ 		// not the public GitHub endpoint. Empty endpoint url is also allowed.
++		// The VinCSS sub-kind is exempt: it is an OSS-supported alternative
++		// OAuth2 provider that intentionally points at a non-github.com host.
+ 		//
+ 		// Note that the enterprise marshaler also calls this marshaler to
+ 		// produce the final output.
+-		if modules.GetModules().IsOSSBuild() {
++		if modules.GetModules().IsOSSBuild() &&
++			githubConnector.SubKind != types.GithubConnectorSubKindVinCSS {
+ 			if githubConnector.Spec.EndpointURL != "" &&
+ 				githubConnector.Spec.EndpointURL != types.GithubURL {
+ 				return nil, fmt.Errorf("GitHub endpoint URL is set: %w", ErrRequiresEnterprise)
+diff --git a/lib/web/apiserver.go b/lib/web/apiserver.go
+index 860bc297f2..a94956d525 100644
+--- a/lib/web/apiserver.go
++++ b/lib/web/apiserver.go
+@@ -969,6 +969,12 @@ func (h *Handler) bindDefaultEndpoints() {
+ 	h.GET("/webapi/github/callback", h.WithMetaRedirect(h.githubCallback))
+ 	h.POST("/webapi/github/login/console", h.WithLimiter(h.githubLoginConsole))
+ 
++	// OIDC connector handlers (in-tree OSS handlers; the auth server gates
++	// non-VinCSS sub-kinds behind the Enterprise OIDC entitlement).
++	h.GET("/webapi/oidc/login/web", h.WithRedirect(h.oidcLoginWeb))
++	h.GET("/webapi/oidc/callback", h.WithMetaRedirect(h.oidcCallback))
++	h.POST("/webapi/oidc/login/console", h.WithLimiter(h.oidcLoginConsole))
++
+ 	// MFA public endpoints.
+ 	h.POST("/webapi/sites/:site/mfa/required", h.WithClusterAuth(h.isMFARequired))
+ 	h.POST("/webapi/mfa/login/begin", h.WithLimiter(h.mfaLoginBegin))
+diff --git a/lib/web/oidc_login.go b/lib/web/oidc_login.go
+new file mode 100644
+index 0000000000..c7753538c0
+--- /dev/null
++++ b/lib/web/oidc_login.go
+@@ -0,0 +1,181 @@
++/*
++ * Teleport
++ * Copyright (C) 2025  Gravitational, Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package web
++
++import (
++	"net"
++	"net/http"
++	"strings"
++
++	"github.com/gravitational/trace"
++	"github.com/julienschmidt/httprouter"
++
++	"github.com/gravitational/teleport/api/types"
++	"github.com/gravitational/teleport/lib/auth"
++	"github.com/gravitational/teleport/lib/client"
++	"github.com/gravitational/teleport/lib/httplib"
++)
++
++// oidcLoginWeb starts the OIDC web login flow: it creates an auth request via
++// the auth server and returns the IdP authorize URL the proxy should redirect
++// to.
++func (h *Handler) oidcLoginWeb(w http.ResponseWriter, r *http.Request, p httprouter.Params) string {
++	logger := h.logger.With("auth", "oidc")
++	logger.DebugContext(r.Context(), "Web login start")
++
++	req, err := ParseSSORequestParams(r)
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Failed to extract SSO parameters from request", "error", err)
++		return client.LoginFailedRedirectURL
++	}
++
++	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Failed to parse request remote address", "error", err)
++		return client.LoginFailedRedirectURL
++	}
++
++	response, err := h.cfg.ProxyClient.CreateOIDCAuthRequest(r.Context(), types.OIDCAuthRequest{
++		CSRFToken:         req.CSRFToken,
++		ConnectorID:       req.ConnectorID,
++		CreateWebSession:  true,
++		ClientRedirectURL: req.ClientRedirectURL,
++		ClientLoginIP:     remoteAddr,
++		ClientUserAgent:   r.UserAgent(),
++	})
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Error creating OIDC auth request", "error", err)
++		return client.LoginFailedRedirectURL
++	}
++	return response.RedirectURL
++}
++
++// oidcLoginConsole starts the OIDC tsh / console login flow: it creates an
++// auth request with the client's public keys attached and returns the IdP
++// authorize URL the caller should open.
++func (h *Handler) oidcLoginConsole(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
++	logger := h.logger.With("auth", "oidc")
++	logger.DebugContext(r.Context(), "Console login start")
++
++	req := new(client.SSOLoginConsoleReq)
++	if err := httplib.ReadResourceJSON(r, req); err != nil {
++		logger.ErrorContext(r.Context(), "Error reading json", "error", err)
++		return nil, trace.AccessDenied("%s", SSOLoginFailureMessage)
++	}
++	if err := req.CheckAndSetDefaults(); err != nil {
++		logger.ErrorContext(r.Context(), "Missing request parameters", "error", err)
++		return nil, trace.AccessDenied("%s", SSOLoginFailureMessage)
++	}
++
++	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Failed to parse request remote address", "error", err)
++		return nil, trace.AccessDenied("%s", SSOLoginFailureMessage)
++	}
++
++	response, err := h.cfg.ProxyClient.CreateOIDCAuthRequest(r.Context(), types.OIDCAuthRequest{
++		ConnectorID:             req.ConnectorID,
++		SshPublicKey:            req.SSHPubKey,
++		TlsPublicKey:            req.TLSPubKey,
++		SshAttestationStatement: req.SSHAttestationStatement.ToProto(),
++		TlsAttestationStatement: req.TLSAttestationStatement.ToProto(),
++		CertTTL:                 req.CertTTL,
++		ClientRedirectURL:       req.RedirectURL,
++		Compatibility:           req.Compatibility,
++		RouteToCluster:          req.RouteToCluster,
++		KubernetesCluster:       req.KubernetesCluster,
++		ClientLoginIP:           remoteAddr,
++	})
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Failed to create OIDC auth request", "error", err)
++		if strings.Contains(err.Error(), auth.InvalidClientRedirectErrorMessage) {
++			return nil, trace.AccessDenied("%s", SSOLoginFailureInvalidRedirect)
++		}
++		return nil, trace.AccessDenied("%s", SSOLoginFailureMessage)
++	}
++	return &client.SSOLoginConsoleResponse{RedirectURL: response.RedirectURL}, nil
++}
++
++// oidcCallback handles the redirect from the IdP after the user authenticates.
++// It validates the callback against the auth server and either sets up a web
++// session (browser login) or builds an SSH response (console login).
++func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request, p httprouter.Params) string {
++	logger := h.logger.With("auth", "oidc")
++	logger.DebugContext(r.Context(), "Callback start", "query", r.URL.Query())
++
++	response, err := h.cfg.ProxyClient.ValidateOIDCAuthCallback(r.Context(), r.URL.Query())
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Error while processing OIDC callback", "error", err)
++		if requestID := r.URL.Query().Get("state"); requestID != "" {
++			if request, errGet := h.cfg.ProxyClient.GetOIDCAuthRequest(r.Context(), requestID); errGet == nil && !request.CreateWebSession {
++				if redURL, errEnc := RedirectURLWithError(request.ClientRedirectURL, err); errEnc == nil {
++					return redURL.String()
++				}
++			}
++		}
++		return client.LoginFailedBadCallbackRedirectURL
++	}
++
++	if response.Req.CreateWebSession {
++		logger.InfoContext(r.Context(), "Redirecting to web browser")
++		res := &SSOCallbackResponse{
++			CSRFToken:         response.Req.CSRFToken,
++			Username:          response.Username,
++			SessionName:       response.Session.GetName(),
++			SessionExpiry:     response.Session.Expiry(),
++			ClientRedirectURL: response.Req.ClientRedirectURL,
++		}
++		if err := SSOSetWebSessionAndRedirectURL(w, r, res, true); err != nil {
++			logger.ErrorContext(r.Context(), "Error setting web session.", "error", err)
++			return client.LoginFailedRedirectURL
++		}
++		if dwt := response.Session.GetDeviceWebToken(); dwt != nil {
++			logger.DebugContext(r.Context(), "OIDC WebSession created with device web token")
++			redirectPath, err := BuildDeviceWebRedirectPath(dwt, res.ClientRedirectURL)
++			if err != nil {
++				logger.DebugContext(r.Context(), "Invalid device web token", "error", err)
++			}
++			return redirectPath
++		}
++		return res.ClientRedirectURL
++	}
++
++	logger.InfoContext(r.Context(), "OIDC callback redirecting to console login")
++	if len(response.Req.SSHPubKey)+len(response.Req.TLSPubKey) == 0 {
++		logger.ErrorContext(r.Context(), "Not a web or console login request")
++		return client.LoginFailedRedirectURL
++	}
++
++	redirectURL, err := ConstructSSHResponse(AuthParams{
++		ClientRedirectURL: response.Req.ClientRedirectURL,
++		Username:          response.Username,
++		Identity:          response.Identity,
++		Session:           response.Session,
++		Cert:              response.Cert,
++		TLSCert:           response.TLSCert,
++		HostSigners:       response.HostSigners,
++		FIPS:              h.cfg.FIPS,
++		ClientOptions:     response.ClientOptions,
++	})
++	if err != nil {
++		logger.ErrorContext(r.Context(), "Error constructing ssh response", "error", err)
++		return client.LoginFailedRedirectURL
++	}
++	return redirectURL.String()
++}
+diff --git a/vincss.readme.md b/vincss.readme.md
+new file mode 100644
+index 0000000000..6548b8c363
+--- /dev/null
++++ b/vincss.readme.md
+@@ -0,0 +1,198 @@
++# VinCSS SSO connectors
++
++Teleport ships two VinCSS presets that work in the OSS build:
++
++| Preset       | Resource kind | Sub-kind      | What it is                                                  |
++| ------------ | ------------- | ------------- | ----------------------------------------------------------- |
++| VinCSS OAuth2 | `github`      | `vincss`      | OAuth2 + custom `/api/user` (GitHub-style claims model)     |
++| VinCSS OIDC   | `oidc`        | `vincss_oidc` | Standards-compliant OIDC: discovery, JWKS, ID token verify  |
++
++Pick OIDC if your VinCSS deployment exposes a standard OIDC issuer (`/.well-known/openid-configuration` + JWKS). Pick OAuth2 only if the deployment exposes the legacy `/api/user` shape described below.
++
++---
++
++## VinCSS OAuth2 connector (sub_kind: vincss)
++
++VinCSS OAuth2 is supported as a preset of the GitHub OAuth2 connector. It reuses the GitHub connector's resource kind, storage, and login flow, with three differences:
++
++1. The connector spec carries `sub_kind: vincss`.
++2. Endpoint URLs and (optionally) OAuth/API paths are read from the connector spec or environment variables — they are not pinned to `github.com`.
++3. VinCSS exposes a single `/api/user` endpoint that returns the user's group membership inline as `teleportGroup []string`. There is no separate teams API. The connector synthesizes group entries under a fixed organization name (`vincss`) so existing `teams_to_roles` mappings work unchanged.
++
++### Auth process environment
++
++Set these on the Teleport auth process before starting it. The endpoint URLs are mandatory; the path overrides are only needed if the VinCSS deployment diverges from the defaults baked into the code.
++
++| Variable                            | Required | Default            | Purpose                                                 |
++| ----------------------------------- | -------- | ------------------ | ------------------------------------------------------- |
++| `TELEPORT_VINCSS_ENDPOINT_URL`      | yes      | (none)             | Base URL serving the OAuth2 authorize / token endpoints |
++| `TELEPORT_VINCSS_API_ENDPOINT_URL`  | yes      | (none)             | Base URL serving the user-info API                      |
++| `TELEPORT_VINCSS_AUTH_PATH`         | no       | `oauth2/authorize` | Override the OAuth2 authorize path                      |
++| `TELEPORT_VINCSS_TOKEN_PATH`        | no       | `oauth2/token`     | Override the OAuth2 token-exchange path                 |
++| `TELEPORT_VINCSS_USER_PATH`         | no       | `api/user`         | Override the user-info API path                         |
++
++The connector spec fields `endpoint_url` and `api_endpoint_url` take precedence over the env vars when set.
++
++### Example connector
++
++Save as `vincss-connector.yaml` and apply with `tctl create -f vincss-connector.yaml`.
++
++```yaml
++kind: github
++sub_kind: vincss
++version: v3
++metadata:
++  name: vincss
++spec:
++  # OAuth2 client credentials issued by the VinCSS IdP.
++  client_id: <vincss-client-id>
++  client_secret: <vincss-client-secret>
++
++  # Proxy URL that VinCSS redirects the browser to after the user
++  # authorizes the request. This path is the same as for GitHub SSO.
++  redirect_url: https://<proxy-public-addr>/v1/webapi/github/callback
++
++  # Optional: button label shown on the login screen.
++  display: VinCSS
++
++  # Optional: pin endpoints in the spec instead of using env vars.
++  # endpoint_url: https://sso.vincss.example.com
++  # api_endpoint_url: https://api.vincss.example.com
++
++  # Map VinCSS teleportGroup values to Teleport roles.
++  # `organization` must be the literal string "vincss" — that is the
++  # synthetic organization the connector groups all teleportGroup
++  # entries under.
++  teams_to_roles:
++    - organization: vincss
++      team: admins
++      roles: [access, editor, auditor]
++    - organization: vincss
++      team: developers
++      roles: [access]
++```
++
++### Expected VinCSS API response
++
++`GET <api_endpoint_url>/api/user` (with `Authorization: token <access_token>`) should return:
++
++```json
++{
++  "username": "alice@vincss.example.com",
++  "user_id": "u-42",
++  "teleportGroup": ["admins", "developers"]
++}
++```
++
++If the JSON keys in your VinCSS deployment differ, edit the `json:"..."` tags on `VinCSSUserResponse` in `lib/auth/github.go`.
++
++### Logging in
++
++Once the connector is created and the auth process has the env vars set:
++
++- **Web UI**: a button labeled with `spec.display` (or `vincss` if unset) appears on the login screen.
++- **tsh**: `tsh login --auth=vincss --proxy=<proxy-public-addr>`.
++
++### Operational notes
++
++- The GitHub Enterprise OSS guard (which normally rejects non-`github.com` endpoint URLs in OSS builds) is bypassed when `sub_kind: vincss`.
++- The `/orgs/<org>/sso` probe used to detect GitHub-Enterprise SSO is also skipped for VinCSS — it is github.com-specific and would always fail.
++- The connector emits the same audit events as the GitHub connector (`github.created`, `github.updated`, `github.deleted`, `user.login` with `method: github`).
++
++---
++
++## VinCSS OIDC connector (sub_kind: vincss_oidc)
++
++VinCSS OIDC is a `kind: oidc` connector that is exempt from the Enterprise-only OIDC entitlement and is served by an in-tree OSS implementation. The flow is the standard OIDC authorization-code grant with PKCE: OIDC discovery, JWKS-based ID token signature verification, and claim-based role mapping. No environment variables are needed — every endpoint is taken from the issuer's `/.well-known/openid-configuration` document at runtime.
++
++### Prerequisites
++
++- The VinCSS deployment must serve a standards-compliant OIDC discovery document at `<issuer_url>/.well-known/openid-configuration` with `authorization_endpoint`, `token_endpoint`, and `jwks_uri`.
++- The OIDC client must be configured to allow the authorization-code response type, PKCE (`S256`), and the redirect URL `https://<proxy-public-addr>/v1/webapi/oidc/callback`.
++
++### Example connector
++
++Save as `vincss-oidc-connector.yaml` and apply with `tctl create -f vincss-oidc-connector.yaml`.
++
++```yaml
++kind: oidc
++sub_kind: vincss_oidc
++version: v3
++metadata:
++  name: vincss-oidc
++spec:
++  # OIDC issuer URL — discovery is fetched from <issuer_url>/.well-known/openid-configuration.
++  issuer_url: https://sso.vincss.example.com
++
++  # OAuth2 client credentials issued by the VinCSS IdP.
++  client_id: <vincss-oidc-client-id>
++  client_secret: <vincss-oidc-client-secret>
++
++  # Proxy URL VinCSS redirects to after the user authorizes the request.
++  redirect_url:
++    - https://<proxy-public-addr>/v1/webapi/oidc/callback
++
++  # Optional: scopes requested in addition to openid. openid is added
++  # automatically if missing.
++  scope: [email, profile, groups]
++
++  # Optional: button label shown on the login screen.
++  display: VinCSS OIDC
++
++  # Map ID token claims to Teleport roles. The connector evaluates each
++  # mapping in order: for every claim whose value matches (literal string
++  # equality, or membership in a JSON array), the listed roles are granted.
++  claims_to_roles:
++    - claim: groups
++      value: admins
++      roles: [access, editor, auditor]
++    - claim: groups
++      value: developers
++      roles: [access]
++    - claim: role
++      value: owner
++      roles: [editor]
++```
++
++### Expected ID token claims
++
++The OSS implementation extracts the username from the first non-empty value among `preferred_username`, `email`, `username`, and falls back to the `sub` claim. Every other claim is flattened into Teleport traits and is available to login rules and role templates.
++
++Minimum ID token payload that passes a `claims_to_roles: [{claim: groups, value: admins, roles: [access]}]` mapping:
++
++```json
++{
++  "iss": "https://sso.vincss.example.com",
++  "aud": "<vincss-oidc-client-id>",
++  "sub": "user-uuid",
++  "preferred_username": "alice@vincss.example.com",
++  "email": "alice@vincss.example.com",
++  "groups": ["admins"],
++  "iat": 1747136400,
++  "exp": 1747140000
++}
++```
++
++Both scalar claims (`"role": "owner"`) and array claims (`"groups": ["admins", "devs"]`) are supported — the connector tests the value against each element of an array claim.
++
++### Logging in
++
++- **Web UI**: a button labeled with `spec.display` appears on the login screen.
++- **tsh**: `tsh login --auth=vincss-oidc --proxy=<proxy-public-addr>`.
++
++### Operational notes
++
++- The OSS OIDC entitlement gate is bypassed only for connectors whose `sub_kind == vincss_oidc`. Standard `kind: oidc` connectors without that sub-kind still require Teleport Enterprise.
++- ID token signatures are verified against the JWKS published by the issuer; the connector refuses tokens whose signing key is not present in JWKS.
++- PKCE (`S256`) is always used. The verifier is stored in the auth request record (`PkceVerifier` field) and consumed on callback.
++- If `claims_to_roles` produces zero matching roles for a user the login is rejected with `AccessDenied` and an `user.login` failure audit event.
++- Audit events use the standard OIDC codes (`T8100I` create / `T8102I` update / `T8101I` delete) and `user.login` with `method: oidc`.
++
++### Troubleshooting
++
++| Symptom                                                      | Likely cause                                                                                    |
++| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
++| `OIDC is only available in Teleport Enterprise`              | `sub_kind` not set to `vincss_oidc` — the entitlement bypass requires the exact sub-kind value. |
++| `Failed to verify VinCSS OIDC ID token`                      | JWKS does not contain the key that signed the ID token (key rotation lag, wrong `kid`).         |
++| `VinCSS OIDC user "..." has no roles matched by claims_to_roles` | The claim/value pair the user actually has does not appear in any `claims_to_roles` entry.  |
++| `VinCSS OIDC discovery failed`                                | `issuer_url` unreachable, returns non-200, or the discovery JSON lacks `jwks_uri`.              |
+-- 
+2.54.0.windows.1
+
+
+From 0b23365227e0894a484cb04791442912d77b76e9 Mon Sep 17 00:00:00 2001
+From: "computer.angel" <computer.angel@gmail.com>
+Date: Wed, 13 May 2026 14:02:24 +0700
+Subject: [PATCH 2/6] Add script to fetch upstream git tags
+
+---
+ fetch-upstream-tag.ps1 | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+ create mode 100644 fetch-upstream-tag.ps1
+
+diff --git a/fetch-upstream-tag.ps1 b/fetch-upstream-tag.ps1
+new file mode 100644
+index 0000000000..29c397accf
+--- /dev/null
++++ b/fetch-upstream-tag.ps1
+@@ -0,0 +1,29 @@
++#!/usr/bin/env pwsh
++[CmdletBinding()]
++param(
++    [Parameter(Mandatory = $true, Position = 0)]
++    [string]$Tag,
++
++    [string]$UpstreamUrl = 'https://github.com/gravitational/teleport'
++)
++
++$ErrorActionPreference = 'Stop'
++
++if (-not (Test-Path -Path '.git')) {
++    throw "Not a git repository (run this from the repo root)."
++}
++
++if (git tag --list $Tag) {
++    Write-Host "Tag '$Tag' already exists locally." -ForegroundColor Yellow
++    exit 0
++}
++
++Write-Host "Fetching tag '$Tag' from $UpstreamUrl..." -ForegroundColor Cyan
++git fetch $UpstreamUrl "refs/tags/${Tag}:refs/tags/${Tag}"
++
++if ($LASTEXITCODE -ne 0) {
++    throw "git fetch failed with exit code $LASTEXITCODE"
++}
++
++Write-Host "Tag '$Tag' fetched successfully." -ForegroundColor Green
++git show $Tag --stat --no-patch
+-- 
+2.54.0.windows.1
+
+
+From 40a57d62a652f23e4dff6daaed04b2246b49bf71 Mon Sep 17 00:00:00 2001
+From: "computer.angel" <computer.angel@gmail.com>
+Date: Wed, 13 May 2026 15:24:24 +0700
+Subject: [PATCH 3/6] Add support for disabling upstream release checks in
+ periodic operations
+
+---
+ lib/auth/auth.go | 42 +++++++++++++++++++++++++-----------------
+ 1 file changed, 25 insertions(+), 17 deletions(-)
+
+diff --git a/lib/auth/auth.go b/lib/auth/auth.go
+index ca1eca623c..fca0174bc5 100644
+--- a/lib/auth/auth.go
++++ b/lib/auth/auth.go
+@@ -1890,6 +1890,12 @@ func (a *Server) runPeriodicOperations() {
+ 		firstReleaseCheck = retryutils.HalfJitter(time.Second * 10)
+ 	}
+ 
++	// VinCSS: TELEPORT_DISABLE_RELEASE_CHECK=yes disables the upstream
++	// release/security-patch version check and the cluster alert banner it
++	// produces. Existing alerts will TTL out (~30m) or can be cleared with
++	// `tctl alerts ack --clear security-patch-available`.
++	releaseCheckDisabled := os.Getenv("TELEPORT_DISABLE_RELEASE_CHECK") == "yes"
++
+ 	// run periodic functions with a semi-random period
+ 	// to avoid contention on the database in case if there are multiple
+ 	// auth servers running - so they don't compete trying
+@@ -1955,23 +1961,25 @@ func (a *Server) runPeriodicOperations() {
+ 			Duration: apidefaults.ServerKeepAliveTTL() * 2,
+ 			Jitter:   retryutils.SeventhJitter,
+ 		})
+-		ticker.Push(interval.SubInterval[periodicIntervalKey]{
+-			Key:           releaseCheckKey,
+-			Duration:      24 * time.Hour,
+-			FirstDuration: firstReleaseCheck,
+-			// note the use of FullJitter for the releases check interval. this lets us ensure
+-			// that frequent restarts don't prevent checks from happening despite the infrequent
+-			// effective check rate.
+-			Jitter: retryutils.FullJitter,
+-		})
+-		// more frequent release check that just re-calculates alerts based on previously
+-		// pulled versioning info.
+-		ticker.Push(interval.SubInterval[periodicIntervalKey]{
+-			Key:           localReleaseCheckKey,
+-			Duration:      10 * time.Minute,
+-			FirstDuration: retryutils.HalfJitter(10 * time.Second),
+-			Jitter:        retryutils.HalfJitter,
+-		})
++		if !releaseCheckDisabled {
++			ticker.Push(interval.SubInterval[periodicIntervalKey]{
++				Key:           releaseCheckKey,
++				Duration:      24 * time.Hour,
++				FirstDuration: firstReleaseCheck,
++				// note the use of FullJitter for the releases check interval. this lets us ensure
++				// that frequent restarts don't prevent checks from happening despite the infrequent
++				// effective check rate.
++				Jitter: retryutils.FullJitter,
++			})
++			// more frequent release check that just re-calculates alerts based on previously
++			// pulled versioning info.
++			ticker.Push(interval.SubInterval[periodicIntervalKey]{
++				Key:           localReleaseCheckKey,
++				Duration:      10 * time.Minute,
++				FirstDuration: retryutils.HalfJitter(10 * time.Second),
++				Jitter:        retryutils.HalfJitter,
++			})
++		}
+ 		ticker.Push(interval.SubInterval[periodicIntervalKey]{
+ 			Key:           autoUpdateAgentReportKey,
+ 			Duration:      constants.AutoUpdateAgentReportPeriod,
+-- 
+2.54.0.windows.1
+
+
+From de949f6d49b8040dadbe80727f7fa20a7c579e67 Mon Sep 17 00:00:00 2001
+From: "computer.angel" <computer.angel@gmail.com>
+Date: Wed, 13 May 2026 15:29:32 +0700
+Subject: [PATCH 4/6] Add documentation for disabling upstream release checks
+ in auth server
+
+---
+ vincss.readme.md | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/vincss.readme.md b/vincss.readme.md
+index 6548b8c363..2bbfcdad90 100644
+--- a/vincss.readme.md
++++ b/vincss.readme.md
+@@ -196,3 +196,27 @@ Both scalar claims (`"role": "owner"`) and array claims (`"groups": ["admins", "
+ | `Failed to verify VinCSS OIDC ID token`                      | JWKS does not contain the key that signed the ID token (key rotation lag, wrong `kid`).         |
+ | `VinCSS OIDC user "..." has no roles matched by claims_to_roles` | The claim/value pair the user actually has does not appear in any `claims_to_roles` entry.  |
+ | `VinCSS OIDC discovery failed`                                | `issuer_url` unreachable, returns non-200, or the discovery JSON lacks `jwks_uri`.              |
++
++---
++
++## Disabling the upstream release / security-patch check
++
++By default the auth server periodically calls the GitHub releases API and emits the cluster alert banner *"A security patch is available for Teleport. Please upgrade your Cluster to vX.Y.Z or newer."* in the Web UI when a newer release is found.
++
++Set this env var on the auth process to turn the check (and the banner) off:
++
++| Variable                          | Value | Effect                                                                                                                 |
++| --------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------- |
++| `TELEPORT_DISABLE_RELEASE_CHECK`  | `yes` | Auth server skips the periodic remote (GitHub) and local release checks. No `upgrade-suggestion` or `security-patch-available` cluster alerts are produced. |
++
++Notes:
++
++- The gate is registered at startup (lib/auth/auth.go, `runPeriodicOperations`), so the env var must be set before the auth process starts; changing it at runtime has no effect until restart.
++- Any alert previously written to the backend has a 30-minute TTL and will expire on its own. To clear it immediately:
++
++  ```bash
++  tctl alerts ack --clear security-patch-available
++  tctl alerts ack --clear upgrade-suggestion
++  ```
++
++- This only affects the version-check banner. Other cluster alerts (license, desktops limit, dynamic labels, etc.) are unaffected.
+-- 
+2.54.0.windows.1
+
+
+From 72366837c3ad73a1db647b4f2668ba7b1558344b Mon Sep 17 00:00:00 2001
+From: Neo <computer.angel@gmail.com>
+Date: Wed, 13 May 2026 19:07:51 +0700
+Subject: [PATCH 5/6] Refactor Github connector functions to use
+ modules.GetModules().BuildType() for consistency
+
+---
+ lib/auth/github.go | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/lib/auth/github.go b/lib/auth/github.go
+index 0d911cc9b4..0df2e0b0a4 100644
+--- a/lib/auth/github.go
++++ b/lib/auth/github.go
+@@ -181,7 +181,7 @@ func (a *Server) CreateGithubAuthRequest(ctx context.Context, req types.GithubAu
+ 
+ // upsertGithubConnector creates or updates a Github connector.
+ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 	upserted, err := a.UpsertGithubConnector(ctx, connector)
+@@ -207,7 +207,7 @@ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // createGithubConnector creates a new Github connector.
+ func (a *Server) createGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 
+@@ -234,7 +234,7 @@ func (a *Server) createGithubConnector(ctx context.Context, connector types.Gith
+ 
+ // updateGithubConnector updates an existing Github connector.
+ func (a *Server) updateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 	updated, err := a.UpdateGithubConnector(ctx, connector)
+@@ -847,7 +847,7 @@ func (a *Server) getGithubUserAndTeams(
+ 	// This is checked when Github auth connectors get created or updated, but
+ 	// check again here in case the organization enabled external SSO after
+ 	// the auth connector was created.
+-	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, a.modules.BuildType(), a.githubOrgSSOCache, nil); err != nil {
++	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 
+-- 
+2.54.0.windows.1
+
+
+From 62ae5726972d38886ef0dcf531bd807150352bf5 Mon Sep 17 00:00:00 2001
+From: Neo <computer.angel@gmail.com>
+Date: Thu, 14 May 2026 09:04:59 +0700
+Subject: [PATCH 6/6] Add build-docker.ps1 script for Dockerized Teleport
+ builds on Windows
+
+---
+ build.assets/build-docker.ps1 | 357 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 357 insertions(+)
+ create mode 100644 build.assets/build-docker.ps1
+
+diff --git a/build.assets/build-docker.ps1 b/build.assets/build-docker.ps1
+new file mode 100644
+index 0000000000..497e88c3f9
+--- /dev/null
++++ b/build.assets/build-docker.ps1
+@@ -0,0 +1,357 @@
++#requires -Version 5.1
++<#
++Dockerized Teleport build for Windows (Option 3 — direct `docker buildx`/`docker run`,
++no make on the host). Mirrors what `make -C build.assets build-binaries` does.
++
++Examples:
++    .\build-docker.ps1                          # OSS Linux amd64 binaries
++    .\build-docker.ps1 -Target enterprise
++    .\build-docker.ps1 -Arch arm64 -SkipWebassets
++    .\build-docker.ps1 -BuildboxOnly            # just (re)build the buildbox images
++
++Output binaries land in <repo-root>\build\.
++#>
++
++[CmdletBinding()]
++param(
++    [ValidateSet('amd64','arm64')]
++    [string]$Arch = 'amd64',
++
++    [ValidateSet('binaries','enterprise','release','fips')]
++    [string]$Target = 'binaries',
++
++    [ValidateSet('linux')]
++    [string]$Os = 'linux',
++
++    [switch]$SkipBuildbox,
++    [switch]$SkipWebassets,
++    [switch]$BuildboxOnly,
++    [switch]$RebuildBuildbox,
++    [switch]$Fido2,
++    [switch]$Piv,
++    [switch]$PurgeCaches
++)
++
++$ErrorActionPreference = 'Stop'
++Set-StrictMode -Version Latest
++
++$BuildAssets = $PSScriptRoot
++$RepoRoot    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
++$SrcDir      = '/go/src/github.com/gravitational/teleport'
++
++function Read-MakeVar {
++    param([string]$Path, [string]$Name)
++    $m = Select-String -Path $Path -Pattern "^$Name\s*\??=" | Select-Object -First 1
++    if (-not $m) { throw "Could not find $Name in $Path" }
++    ($m.Line -split '=', 2)[1].Trim()
++}
++
++function Read-RustChannel {
++    param([string]$Path)
++    $m = Select-String -Path $Path -Pattern '^\s*channel\s*=' | Select-Object -First 1
++    if (-not $m) { throw "Could not find channel in $Path" }
++    (($m.Line -split '=', 2)[1].Trim()) -replace '"', ''
++}
++
++function Read-WasmBindgenVersion {
++    param([string]$Path)
++    $lines = Get-Content -LiteralPath $Path
++    $inPkg = $false
++    foreach ($line in $lines) {
++        if ($line -match '^\s*name\s*=\s*"wasm-bindgen"\s*$') { $inPkg = $true; continue }
++        if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { return $Matches[1] }
++        if ($inPkg -and $line -match '^\s*\[\[package\]\]') { $inPkg = $false }
++    }
++    return $null
++}
++
++# --- Resolve versions ----------------------------------------------------
++$VersionsMk      = Join-Path $BuildAssets 'versions.mk'
++$ImagesMk        = Join-Path $BuildAssets 'images.mk'
++$RustToolchain   = Join-Path $RepoRoot   'rust-toolchain.toml'
++$CargoLock       = Join-Path $RepoRoot   'Cargo.lock'
++
++$GOLANG_VERSION       = Read-MakeVar $VersionsMk 'GOLANG_VERSION'
++$NODE_VERSION         = Read-MakeVar $VersionsMk 'NODE_VERSION'
++$WASM_OPT_VERSION     = Read-MakeVar $VersionsMk 'WASM_OPT_VERSION'
++$LIBBPF_VERSION       = Read-MakeVar $VersionsMk 'LIBBPF_VERSION'
++$LIBPCSCLITE_VERSION  = Read-MakeVar $VersionsMk 'LIBPCSCLITE_VERSION'
++$DEVTOOLSET           = Read-MakeVar $VersionsMk 'DEVTOOLSET'
++$BUILDBOX_VERSION     = Read-MakeVar $ImagesMk   'BUILDBOX_VERSION'
++$BUILDBOX_BASE_NAME   = Read-MakeVar $ImagesMk   'BUILDBOX_BASE_NAME'
++$RUST_VERSION         = Read-RustChannel $RustToolchain
++$WASM_BINDGEN_VERSION = if (Test-Path $CargoLock) { Read-WasmBindgenVersion $CargoLock } else { '' }
++
++$BUILDBOX_CENTOS7_ASSETS = "${BUILDBOX_BASE_NAME}-centos7-assets:${BUILDBOX_VERSION}-${Arch}"
++$BUILDBOX_CENTOS7        = "${BUILDBOX_BASE_NAME}-centos7:${BUILDBOX_VERSION}-${Arch}"
++$BUILDBOX_CENTOS7_FIPS   = "${BUILDBOX_BASE_NAME}-centos7-fips:${BUILDBOX_VERSION}-${Arch}"
++$BUILDBOX_NODE           = "${BUILDBOX_BASE_NAME}-node:${BUILDBOX_VERSION}-${Arch}"
++
++Write-Host "==> versions" -ForegroundColor Cyan
++Write-Host "    arch                = $Arch"
++Write-Host "    buildbox version    = $BUILDBOX_VERSION"
++Write-Host "    go                  = $GOLANG_VERSION"
++Write-Host "    rust                = $RUST_VERSION"
++Write-Host "    node                = $NODE_VERSION"
++Write-Host "    devtoolset          = $DEVTOOLSET"
++Write-Host "    libbpf              = $LIBBPF_VERSION"
++Write-Host "    libpcsclite         = $LIBPCSCLITE_VERSION"
++Write-Host "    wasm-opt            = $WASM_OPT_VERSION"
++Write-Host "    wasm-bindgen        = $WASM_BINDGEN_VERSION"
++Write-Host ""
++
++# --- Helpers -------------------------------------------------------------
++function Invoke-Native {
++    param([Parameter(ValueFromRemainingArguments)]$Args)
++    Write-Host "+ $($Args -join ' ')" -ForegroundColor DarkGray
++    & $Args[0] @($Args | Select-Object -Skip 1)
++    if ($LASTEXITCODE -ne 0) { throw "Command failed (exit $LASTEXITCODE): $($Args -join ' ')" }
++}
++
++# Force LF endings on files that get parsed by Linux tooling inside the container.
++# Git on Windows with core.autocrlf=true checks these out as CRLF, which breaks:
++#   - heredoc-written shell scripts: `bad interpreter: /bin/sh^M`
++#   - Makefile awk over Cargo.lock: "Unknown wasm-bindgen version"
++#   - GNU make line-continuations and recipe parsing
++function Repair-Eol {
++    param([string]$BuildAssetsDir, [string]$RepoRootDir)
++    $targets = New-Object System.Collections.Generic.List[string]
++    # Anything sourced/executed inside the buildbox.
++    Get-ChildItem -Path $BuildAssetsDir -File -Recurse -Include @('Dockerfile*', '*.sh') |
++        ForEach-Object { $targets.Add($_.FullName) }
++    # Files at repo root that the container Makefile reads.
++    foreach ($name in @('Cargo.lock', 'go.mod', 'go.sum', 'Makefile', 'rust-toolchain.toml')) {
++        $p = Join-Path $RepoRootDir $name
++        if (Test-Path $p) { $targets.Add((Resolve-Path $p).Path) }
++    }
++    Get-ChildItem -Path $RepoRootDir -File -Filter '*.mk' |
++        ForEach-Object { $targets.Add($_.FullName) }
++
++    foreach ($path in $targets) {
++        $bytes = [IO.File]::ReadAllBytes($path)
++        if ($bytes -notcontains 13) { continue }
++        $text = [IO.File]::ReadAllText($path)
++        [IO.File]::WriteAllText($path, ($text -replace "`r`n", "`n"))
++        Write-Host "    LF-normalized $path" -ForegroundColor Yellow
++    }
++}
++
++function Test-LocalImage {
++    param([string]$Image)
++    $null = & docker image inspect $Image 2>$null
++    return ($LASTEXITCODE -eq 0)
++}
++
++function Try-PullImage {
++    param([string]$Image)
++    Write-Host "==> trying to pull $Image" -ForegroundColor Cyan
++    & docker pull $Image 2>&1 | Write-Host
++    return ($LASTEXITCODE -eq 0)
++}
++
++function Ensure-PrebuiltOrBuild {
++    param(
++        [string]$Image,
++        [scriptblock]$BuildFn
++    )
++    if (-not $RebuildBuildbox -and (Test-LocalImage $Image)) {
++        Write-Host "==> $Image already present locally" -ForegroundColor Green
++        return
++    }
++    if (-not $RebuildBuildbox -and (Try-PullImage $Image)) {
++        Write-Host "==> $Image pulled from registry" -ForegroundColor Green
++        return
++    }
++    Write-Host "==> local build for $Image (CentOS 7 base may fail — upstream EOL)" -ForegroundColor Yellow
++    & $BuildFn
++}
++
++function Build-BuildboxNode {
++    Write-Host "==> building $BUILDBOX_NODE" -ForegroundColor Cyan
++    Invoke-Native docker buildx build `
++        --build-arg "BUILDARCH=$Arch" `
++        --build-arg "UID=1000" `
++        --build-arg "GID=1000" `
++        --build-arg "NODE_VERSION=$NODE_VERSION" `
++        --build-arg "RUST_VERSION=$RUST_VERSION" `
++        --build-arg "WASM_OPT_VERSION=$WASM_OPT_VERSION" `
++        --build-arg "WASM_BINDGEN_VERSION=$WASM_BINDGEN_VERSION" `
++        --load `
++        --tag $BUILDBOX_NODE `
++        -f (Join-Path $BuildAssets 'Dockerfile-node') $BuildAssets
++}
++
++function Build-BuildboxCentos7 {
++    param([string]$BuildTarget = 'buildbox', [string]$Tag = $BUILDBOX_CENTOS7)
++    Write-Host "==> building $Tag (target=$BuildTarget)" -ForegroundColor Cyan
++    Invoke-Native docker buildx build `
++        --target $BuildTarget `
++        --build-arg "UID=1000" `
++        --build-arg "GID=1000" `
++        --build-arg "BUILDBOX_CENTOS7_ASSETS=$BUILDBOX_CENTOS7_ASSETS" `
++        --build-arg "BUILDARCH=$Arch" `
++        --build-arg "TARGETARCH=$Arch" `
++        --build-arg "GOLANG_VERSION=$GOLANG_VERSION" `
++        --build-arg "RUST_VERSION=$RUST_VERSION" `
++        --build-arg "DEVTOOLSET=$DEVTOOLSET" `
++        --build-arg "LIBBPF_VERSION=$LIBBPF_VERSION" `
++        --build-arg "LIBPCSCLITE_VERSION=$LIBPCSCLITE_VERSION" `
++        --load `
++        --tag $Tag `
++        -f (Join-Path $BuildAssets 'Dockerfile-centos7') $BuildAssets
++}
++
++# Named volumes persist Go/Rust/Node caches across runs. Scoped by arch so
++# amd64 and arm64 builds don't trash each other's artifacts. node_modules is
++# shadowed by a named volume so pnpm's hardlink-heavy tree stays inside the
++# Linux VM filesystem (Docker Desktop bind mounts on Windows are slow and
++# break pnpm's rename/hardlink ops).
++$Script:CacheVolumes = [ordered]@{
++    "teleport-buildbox-gomodcache-$Arch"   = '/tmp/gomodcache'
++    "teleport-buildbox-gocache-$Arch"      = '/tmp/gocache'
++    "teleport-buildbox-cargo-$Arch"        = '/home/ci/.cargo'
++    "teleport-buildbox-xdgcache-$Arch"     = '/home/ci/.cache'
++    "teleport-buildbox-node-modules-$Arch" = "$SrcDir/node_modules"
++}
++$Script:CacheVolumesInitialized = $false
++
++function Remove-CacheVolumes {
++    Write-Host "==> removing cache volumes" -ForegroundColor Yellow
++    foreach ($name in $Script:CacheVolumes.Keys) {
++        & docker volume rm $name 2>&1 | Out-Null
++    }
++}
++
++function Initialize-CacheVolumes {
++    param([string]$Image)
++    if ($Script:CacheVolumesInitialized) { return }
++    Write-Host "==> initializing cache volume ownership (uid/gid 1000)" -ForegroundColor Cyan
++    $args = @('--rm', '-u', '0:0')
++    foreach ($kv in $Script:CacheVolumes.GetEnumerator()) {
++        $args += @('-v', "$($kv.Key):$($kv.Value)")
++    }
++    # chown by name (ci:ci) rather than a hardcoded uid: the published
++    # buildbox images use uid 1001, locally-built ones use 1000. -R covers any
++    # leftover root-owned entries from earlier failed runs.
++    $paths = ($Script:CacheVolumes.Values | ForEach-Object { $_ }) -join ' '
++    $cmd = "chown -R ci:ci $paths && chmod -R u+rwX,g+rwX $paths"
++    $args += @($Image, 'sh', '-c', $cmd)
++    Invoke-Native docker run @args
++    $Script:CacheVolumesInitialized = $true
++}
++
++function Get-DockerRunArgs {
++    param([string]$Image)
++    $mount = "${RepoRoot}:${SrcDir}"
++    $args = @(
++        '--rm',
++        '-v', $mount
++    )
++    foreach ($kv in $Script:CacheVolumes.GetEnumerator()) {
++        $args += @('-v', "$($kv.Key):$($kv.Value)")
++    }
++    $args += @(
++        '-w', $SrcDir,
++        '-h', 'buildbox',
++        '-u', 'ci:ci',
++        '-e', 'HOME=/home/ci',
++        '-e', 'GOMODCACHE=/tmp/gomodcache',
++        '-e', 'GOCACHE=/tmp/gocache',
++        '-e', 'CARGO_HOME=/home/ci/.cargo',
++        '-e', 'XDG_CACHE_HOME=/home/ci/.cache',
++        '-e', 'HELM_PLUGINS=/home/ci/.local/share/helm/plugins-new',
++        '-e', 'CI=true',
++        $Image
++    )
++    return ,$args
++}
++
++function Build-Webassets {
++    Write-Host "==> building webassets in $BUILDBOX_NODE" -ForegroundColor Cyan
++    Initialize-CacheVolumes -Image $BUILDBOX_NODE
++    $extra = if (Test-Path (Join-Path $RepoRoot 'e\Makefile')) { 'ensure-webassets-e' } else { '' }
++    $makeArgs = @('ensure-webassets')
++    if ($extra) { $makeArgs += $extra }
++    $runArgs = Get-DockerRunArgs $BUILDBOX_NODE
++    Invoke-Native docker run @runArgs /usr/bin/make @makeArgs
++}
++
++function Invoke-Build {
++    $fido2 = if ($Fido2) { 'yes' } else { 'no' }
++    $piv   = if ($Piv)   { 'yes' } else { 'no' }
++
++    $initImage = if ($Target -eq 'fips') { $BUILDBOX_CENTOS7_FIPS } else { $BUILDBOX_CENTOS7 }
++    Initialize-CacheVolumes -Image $initImage
++
++    switch ($Target) {
++        'binaries' {
++            $image = $BUILDBOX_CENTOS7
++            $makeCmd = "make clean-build full -e ADDFLAGS='' OS=$Os ARCH=$Arch RUNTIME=$GOLANG_VERSION FIDO2=$fido2 PIV=$piv REPRODUCIBLE=no"
++            $runArgs = Get-DockerRunArgs $image
++            Write-Host "==> building OSS binaries" -ForegroundColor Cyan
++            Invoke-Native docker run @runArgs /usr/bin/scl enable $DEVTOOLSET $makeCmd
++        }
++        'enterprise' {
++            $image = $BUILDBOX_CENTOS7
++            $makeCmd = "make clean-build full-ent -e ADDFLAGS='' OS=$Os ARCH=$Arch RUNTIME=$GOLANG_VERSION FIDO2=$fido2 PIV=$piv REPRODUCIBLE=no"
++            $runArgs = Get-DockerRunArgs $image
++            Write-Host "==> building Enterprise binaries" -ForegroundColor Cyan
++            Invoke-Native docker run @runArgs /usr/bin/scl enable $DEVTOOLSET $makeCmd
++        }
++        'release' {
++            $image = $BUILDBOX_CENTOS7
++            $runArgs = Get-DockerRunArgs $image
++            Write-Host "==> building release tarball" -ForegroundColor Cyan
++            Invoke-Native docker run @runArgs make -C $SrcDir PIV=$piv release-unix-preserving-webassets
++        }
++        'fips' {
++            $image = $BUILDBOX_CENTOS7_FIPS
++            $runArgs = Get-DockerRunArgs $image
++            Write-Host "==> building FIPS enterprise binaries" -ForegroundColor Cyan
++            Invoke-Native docker run @runArgs make -C "$SrcDir/e" PIV=$piv FIPS=yes clean full
++        }
++    }
++}
++
++# --- Run -----------------------------------------------------------------
++Push-Location $BuildAssets
++try {
++    if ($PurgeCaches) { Remove-CacheVolumes }
++
++    Write-Host "==> normalizing line endings (build.assets + repo-root build files)" -ForegroundColor Cyan
++    Repair-Eol -BuildAssetsDir $BuildAssets -RepoRootDir $RepoRoot
++
++    if (-not $SkipBuildbox) {
++        if ($Target -eq 'fips') {
++            Ensure-PrebuiltOrBuild -Image $BUILDBOX_CENTOS7_FIPS -BuildFn {
++                Build-BuildboxCentos7 -BuildTarget 'buildbox-fips' -Tag $BUILDBOX_CENTOS7_FIPS
++            }
++        } else {
++            Ensure-PrebuiltOrBuild -Image $BUILDBOX_CENTOS7 -BuildFn {
++                Build-BuildboxCentos7
++            }
++        }
++        if (-not $SkipWebassets -and -not $BuildboxOnly) {
++            Ensure-PrebuiltOrBuild -Image $BUILDBOX_NODE -BuildFn {
++                Build-BuildboxNode
++            }
++        }
++    }
++
++    if ($BuildboxOnly) {
++        Write-Host "buildbox(es) built. Skipping final build (-BuildboxOnly)." -ForegroundColor Green
++        return
++    }
++
++    if (-not $SkipWebassets) {
++        Build-Webassets
++    }
++
++    Invoke-Build
++
++    Write-Host ""
++    Write-Host "Done. Binaries in $RepoRoot\build" -ForegroundColor Green
++}
++finally {
++    Pop-Location
++}
+-- 
+2.54.0.windows.1
+
