@@ -317,6 +317,18 @@ func PopulateGithubClaims(user *GithubUserResponse, teams []GithubTeamResponse) 
 	return populateGithubClaims(user, teams)
 }
 
+func MatchOIDCClaims(mappings []types.ClaimMapping, claims map[string]any) []string {
+	return matchOIDCClaims(mappings, claims)
+}
+
+func ClaimsToTraits(claims map[string]any) map[string][]string {
+	return claimsToTraits(claims)
+}
+
+func PickOIDCUsername(claims map[string]any, sub string) string {
+	return pickOIDCUsername(claims, sub)
+}
+
 func ValidateGithubAuthCallbackHelper(ctx context.Context, m GitHubManager, diagCtx *SSODiagContext, q url.Values, emitter apievents.Emitter, logger *slog.Logger) (*authclient.GithubAuthResponse, error) {
 	return validateGithubAuthCallbackHelper(ctx, m, diagCtx, q, emitter, logger)
 }

@@ -19,6 +19,7 @@ package types
 import (
 	"context"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -31,6 +32,44 @@ import (
 const (
 	GithubURL    = "https://github.com"
 	GithubAPIURL = "https://api.github.com"
+
+	// GithubConnectorSubKindVinCSS marks a GithubConnector that targets a
+	// VinCSS OAuth2 identity provider instead of github.com. The connector
+	// reuses GitHub's claims model (orgs/teams) but reads its endpoint URLs
+	// from the spec or the TELEPORT_VINCSS_ENDPOINT_URL /
+	// TELEPORT_VINCSS_API_ENDPOINT_URL environment variables.
+	GithubConnectorSubKindVinCSS = "vincss"
+
+	// EnvVinCSSEndpointURL is the env var that supplies the VinCSS endpoint
+	// URL when the connector spec does not set EndpointURL explicitly.
+	EnvVinCSSEndpointURL = "TELEPORT_VINCSS_ENDPOINT_URL"
+	// EnvVinCSSAPIEndpointURL is the env var that supplies the VinCSS API
+	// endpoint URL when the connector spec does not set APIEndpointURL
+	// explicitly.
+	EnvVinCSSAPIEndpointURL = "TELEPORT_VINCSS_API_ENDPOINT_URL"
+
+	// VinCSSAuthPath is the default OAuth2 authorize path on the VinCSS IdP.
+	VinCSSAuthPath = "oauth2/authorize"
+	// VinCSSTokenPath is the default OAuth2 token-exchange path on the VinCSS IdP.
+	VinCSSTokenPath = "oauth2/token"
+	// VinCSSUserPath is the default API path for the authenticated user's
+	// profile on the VinCSS IdP. The response includes a `teleportGroup`
+	// field that supplies the user's group/team membership; VinCSS does not
+	// expose a separate teams API.
+	VinCSSUserPath = "oauth2/profile"
+
+	// EnvVinCSSAuthPath overrides VinCSSAuthPath when set.
+	EnvVinCSSAuthPath = "TELEPORT_VINCSS_AUTH_PATH"
+	// EnvVinCSSTokenPath overrides VinCSSTokenPath when set.
+	EnvVinCSSTokenPath = "TELEPORT_VINCSS_TOKEN_PATH"
+	// EnvVinCSSUserPath overrides VinCSSUserPath when set.
+	EnvVinCSSUserPath = "TELEPORT_VINCSS_USER_PATH"
+
+	// VinCSSOrganization is the synthetic organization name used to group
+	// the strings returned in the VinCSS userResponse.teleportGroup field
+	// into the existing GitHub-style claims structure. Configure
+	// teams_to_roles entries with this organization name.
+	VinCSSOrganization = "vincss"
 )
 
 // GithubConnector defines an interface for a Github OAuth2 connector
@@ -188,6 +227,12 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
 		return trace.Wrap(err)
 	}
 
+	switch c.SubKind {
+	case "", GithubConnectorSubKindVinCSS:
+	default:
+		return trace.BadParameter("unsupported GitHub connector sub_kind %q", c.SubKind)
+	}
+
 	// DELETE IN 11.0.0
 	if len(c.Spec.TeamsToLogins) > 0 {
 		slog.WarnContext(context.Background(), "GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
@@ -278,11 +323,23 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 
 // GetEndpointURL returns the endpoint URL
 func (c *GithubConnectorV3) GetEndpointURL() string {
+	if c.SubKind == GithubConnectorSubKindVinCSS {
+		if c.Spec.EndpointURL != "" {
+			return c.Spec.EndpointURL
+		}
+		return os.Getenv(EnvVinCSSEndpointURL)
+	}
 	return GithubURL
 }
 
 // GetEndpointURL returns the API endpoint URL
 func (c *GithubConnectorV3) GetAPIEndpointURL() string {
+	if c.SubKind == GithubConnectorSubKindVinCSS {
+		if c.Spec.APIEndpointURL != "" {
+			return c.Spec.APIEndpointURL
+		}
+		return os.Getenv(EnvVinCSSAPIEndpointURL)
+	}
 	return GithubAPIURL
 }
 
