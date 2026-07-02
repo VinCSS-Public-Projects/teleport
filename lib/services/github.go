@@ -178,10 +178,13 @@ func MarshalOSSGithubConnector(githubConnector types.GithubConnector, opts ...Ma
 
 		// Return an error for OSS build if the endpoint url is set, but it is
 		// not the public GitHub endpoint. Empty endpoint url is also allowed.
+		// The VinCSS sub-kind is exempt: it is an OSS-supported alternative
+		// OAuth2 provider that intentionally points at a non-github.com host.
 		//
 		// Note that the enterprise marshaler also calls this marshaler to
 		// produce the final output.
-		if modules.GetModules().IsOSSBuild() {
+		if modules.GetModules().IsOSSBuild() &&
+			githubConnector.SubKind != types.GithubConnectorSubKindVinCSS {
 			if githubConnector.Spec.EndpointURL != "" &&
 				githubConnector.Spec.EndpointURL != types.GithubURL {
 				return nil, fmt.Errorf("GitHub endpoint URL is set: %w", ErrRequiresEnterprise)
