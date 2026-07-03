@@ -1942,6 +1942,12 @@ func (a *Server) runPeriodicOperations() {
 		firstReleaseCheck = retryutils.HalfJitter(time.Second * 10)
 	}
 
+	// VinCSS: TELEPORT_DISABLE_RELEASE_CHECK=yes disables the upstream
+	// release/security-patch version check and the cluster alert banner it
+	// produces. Existing alerts will TTL out (~30m) or can be cleared with
+	// `tctl alerts ack --clear security-patch-available`.
+	releaseCheckDisabled := os.Getenv("TELEPORT_DISABLE_RELEASE_CHECK") == "yes"
+
 	// run periodic functions with a semi-random period
 	// to avoid contention on the database in case if there are multiple
 	// auth servers running - so they don't compete trying
@@ -2007,23 +2013,25 @@ func (a *Server) runPeriodicOperations() {
 			Duration: apidefaults.ServerKeepAliveTTL() * 2,
 			Jitter:   retryutils.SeventhJitter,
 		})
-		ticker.Push(interval.SubInterval[periodicIntervalKey]{
-			Key:           releaseCheckKey,
-			Duration:      24 * time.Hour,
-			FirstDuration: firstReleaseCheck,
-			// note the use of FullJitter for the releases check interval. this lets us ensure
-			// that frequent restarts don't prevent checks from happening despite the infrequent
-			// effective check rate.
-			Jitter: retryutils.FullJitter,
-		})
-		// more frequent release check that just re-calculates alerts based on previously
-		// pulled versioning info.
-		ticker.Push(interval.SubInterval[periodicIntervalKey]{
-			Key:           localReleaseCheckKey,
-			Duration:      10 * time.Minute,
-			FirstDuration: retryutils.HalfJitter(10 * time.Second),
-			Jitter:        retryutils.HalfJitter,
-		})
+		if !releaseCheckDisabled {
+			ticker.Push(interval.SubInterval[periodicIntervalKey]{
+				Key:           releaseCheckKey,
+				Duration:      24 * time.Hour,
+				FirstDuration: firstReleaseCheck,
+				// note the use of FullJitter for the releases check interval. this lets us ensure
+				// that frequent restarts don't prevent checks from happening despite the infrequent
+				// effective check rate.
+				Jitter: retryutils.FullJitter,
+			})
+			// more frequent release check that just re-calculates alerts based on previously
+			// pulled versioning info.
+			ticker.Push(interval.SubInterval[periodicIntervalKey]{
+				Key:           localReleaseCheckKey,
+				Duration:      10 * time.Minute,
+				FirstDuration: retryutils.HalfJitter(10 * time.Second),
+				Jitter:        retryutils.HalfJitter,
+			})
+		}
 		ticker.Push(interval.SubInterval[periodicIntervalKey]{
 			Key:           autoUpdateAgentReportKey,
 			Duration:      constants.AutoUpdateAgentReportPeriod,
