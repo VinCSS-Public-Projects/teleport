@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -180,7 +181,7 @@ func (a *Server) CreateGithubAuthRequest(ctx context.Context, req types.GithubAu
 
 // upsertGithubConnector creates or updates a Github connector.
 func (a *Server) upsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
+	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	upserted, err := a.UpsertGithubConnector(ctx, connector)
@@ -206,7 +207,7 @@ func (a *Server) upsertGithubConnector(ctx context.Context, connector types.Gith
 
 // createGithubConnector creates a new Github connector.
 func (a *Server) createGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
+	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -233,7 +234,7 @@ func (a *Server) createGithubConnector(ctx context.Context, connector types.Gith
 
 // updateGithubConnector updates an existing Github connector.
 func (a *Server) updateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
-	if err := checkGithubOrgSSOSupport(ctx, connector, nil, a.githubOrgSSOCache, nil); err != nil {
+	if err := checkGithubOrgSSOSupport(ctx, connector, nil, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	updated, err := a.UpdateGithubConnector(ctx, connector)
@@ -269,9 +270,14 @@ type httpRequester interface {
 // If userTeams is not nil, only organizations that are both specified
 // in conn and in userTeams will be checked. If client is nil a
 // net/http.Client will be used.
-func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, orgCache *utils.FnCache, client httpRequester) error {
-	version := modules.GetModules().BuildType()
-	if version == modules.BuildEnterprise {
+func checkGithubOrgSSOSupport(ctx context.Context, conn types.GithubConnector, userTeams []GithubTeamResponse, buildType string, orgCache *utils.FnCache, client httpRequester) error {
+	if buildType == modules.BuildEnterprise {
+		return nil
+	}
+	// The /orgs/<org>/sso probe below is github.com-specific. VinCSS targets
+	// a different OAuth2 provider that does not expose that endpoint, so
+	// skip the check entirely for the VinCSS sub-kind.
+	if conn.GetSubKind() == types.GithubConnectorSubKindVinCSS {
 		return nil
 	}
 
@@ -341,7 +347,7 @@ func orgUsesExternalSSO(ctx context.Context, endpointURL, org string, client htt
 
 	const retries = 3
 	var resp *http.Response
-	for i := 0; i < retries; i++ {
+	for i := range retries {
 		var err error
 		var urlErr *url.Error
 
@@ -522,15 +528,32 @@ func (a *Server) getGithubConnector(ctx context.Context, request types.GithubAut
 	return connector, nil
 }
 
+// pathForSubKind returns the path to use for a SubKind-specific endpoint.
+// For VinCSS connectors the env override wins, then the VinCSS default;
+// for GitHub the github default is returned unchanged.
+func pathForSubKind(subKind, envVar, vinCSSDefault, githubDefault string) string {
+	if subKind == types.GithubConnectorSubKindVinCSS {
+		if p := os.Getenv(envVar); p != "" {
+			return p
+		}
+		return vinCSSDefault
+	}
+	return githubDefault
+}
+
 func newGithubOAuth2Config(connector types.GithubConnector) oauth2.Config {
+	authPath := pathForSubKind(connector.GetSubKind(),
+		types.EnvVinCSSAuthPath, types.VinCSSAuthPath, GithubAuthPath)
+	tokenPath := pathForSubKind(connector.GetSubKind(),
+		types.EnvVinCSSTokenPath, types.VinCSSTokenPath, GithubTokenPath)
 	return oauth2.Config{
 		ClientID:     connector.GetClientID(),
 		ClientSecret: connector.GetClientSecret(),
 		RedirectURL:  connector.GetRedirectURL(),
 		Scopes:       GithubScopes,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  fmt.Sprintf("%s/%s", connector.GetEndpointURL(), GithubAuthPath),
-			TokenURL: fmt.Sprintf("%s/%s", connector.GetEndpointURL(), GithubTokenPath),
+			AuthURL:  fmt.Sprintf("%s/%s", connector.GetEndpointURL(), authPath),
+			TokenURL: fmt.Sprintf("%s/%s", connector.GetEndpointURL(), tokenPath),
 		},
 	}
 }
@@ -777,6 +800,7 @@ func (a *Server) getGitHubAPIClient(
 		token:       token.AccessToken,
 		authServer:  a,
 		apiEndpoint: apiEndpoint,
+		subKind:     connector.GetSubKind(),
 	}, nil
 }
 
@@ -798,6 +822,15 @@ func (a *Server) getGithubUserAndTeams(
 		return nil, nil, trace.Wrap(err)
 	}
 
+	if connector.GetSubKind() == types.GithubConnectorSubKindVinCSS {
+		userResp, teamsResp, err := ghClient.getVinCSSIdentity()
+		if err != nil {
+			return nil, nil, trace.Wrap(err, "failed to query VinCSS user info")
+		}
+		logger.DebugContext(ctx, "Retrieved teleportGroup for VinCSS user.", "num_groups", len(teamsResp), "vincss_user", userResp.Login)
+		return userResp, teamsResp, nil
+	}
+
 	userResp, err := ghClient.getUser()
 	if err != nil {
 		return nil, nil, trace.Wrap(err, "failed to query GitHub user info")
@@ -814,7 +847,7 @@ func (a *Server) getGithubUserAndTeams(
 	// This is checked when Github auth connectors get created or updated, but
 	// check again here in case the organization enabled external SSO after
 	// the auth connector was created.
-	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, a.githubOrgSSOCache, nil); err != nil {
+	if err := checkGithubOrgSSOSupport(ctx, connector, teamsResp, modules.GetModules().BuildType(), a.githubOrgSSOCache, nil); err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
 
@@ -1019,27 +1052,6 @@ func (a *Server) createGithubUser(ctx context.Context, p *CreateUserParams, dryR
 	return user, nil
 }
 
-// ValidateClientRedirect checks a desktop client redirect URL for SSO logins
-// against some (potentially nil) settings from an auth connector; in the
-// current implementation, that means either "http" schema with a hostname of
-// "localhost", "127.0.0.1", or "::1" and a path of "/callback" (with any port),
-// or "https" schema with a hostname that matches one in the https_hostname
-// list, a path of "/callback" and either an empty port or explicitly 443. The
-// settings are ignored and only localhost URLs are allowed if we're using an
-// ephemeral connector (in the SSO testing flow). If the insecure_allowed_cidr_ranges
-// list is non-empty URLs in both the "http" and "https" schema are allowed
-// if the hostname is an IP address that is contained in a specified CIDR
-// range on any port.
-//
-// TODO(Joerger): Replaced by [sso.ValidateClientRedirect], remove once /e no longer depends on it
-func ValidateClientRedirect(clientRedirect string, ssoTestFlow bool, settings *types.SSOClientRedirectSettings) error {
-	ceremonyType := sso.CeremonyTypeLogin
-	if ssoTestFlow {
-		ceremonyType = sso.CeremonyTypeTest
-	}
-	return sso.ValidateClientRedirect(clientRedirect, ceremonyType, settings)
-}
-
 // populateGithubClaims builds a GithubClaims using queried
 // user, organization and teams information.
 func populateGithubClaims(user *GithubUserResponse, teams []GithubTeamResponse) (*types.GithubClaims, error) {
@@ -1071,6 +1083,9 @@ type githubAPIClient struct {
 	// apiEndpoint is the API endpoint of the Github instance
 	// to connect to.
 	apiEndpoint string
+	// subKind is the connector sub-kind (e.g. "vincss") used to pick the
+	// right API paths and response shapes. Empty for github.com.
+	subKind string
 }
 
 // GithubUserResponse represents response from "user" API call
@@ -1079,10 +1094,36 @@ type GithubUserResponse struct {
 	Login string `json:"login"`
 	// ID is the user ID
 	ID int64 `json:"id"`
+
+	// idOverride is a string user identifier used by providers (like VinCSS)
+	// that do not return integer IDs. When non-empty it is returned by
+	// getIDStr instead of ID.
+	idOverride string
 }
 
 func (r GithubUserResponse) getIDStr() string {
+	if r.idOverride != "" {
+		return r.idOverride
+	}
 	return fmt.Sprintf("%v", r.ID)
+}
+
+// VinCSSUserResponse is the VinCSS user-info API response. VinCSS returns a
+// string user identifier rather than GitHub's int64 ID, and embeds the
+// user's group/team membership directly under teleportGroup (no separate
+// teams endpoint). Adjust the JSON tags to match the deployed VinCSS API
+// shape.
+type VinCSSUserResponse struct {
+	Username      string   `json:"username"`
+	UserID        string   `json:"user_id"`
+	TeleportGroup []string `json:"teleportGroup"`
+}
+
+func (v VinCSSUserResponse) toGithubUserResponse() *GithubUserResponse {
+	return &GithubUserResponse{
+		Login:      v.Username,
+		idOverride: v.UserID,
+	}
 }
 
 func (r GithubUserResponse) makeExternalIdentity(connectorID string) types.ExternalIdentity {
@@ -1106,6 +1147,32 @@ func (c *githubAPIClient) getUser() (*GithubUserResponse, error) {
 		return nil, trace.Wrap(err)
 	}
 	return &user, nil
+}
+
+// getVinCSSIdentity fetches the user profile from the VinCSS user-info API
+// and synthesizes the team membership from the user-response teleportGroup
+// field. VinCSS does not expose a separate teams endpoint, so all groups are
+// mapped under the VinCSSOrganization synthetic organization.
+func (c *githubAPIClient) getVinCSSIdentity() (*GithubUserResponse, []GithubTeamResponse, error) {
+	userPath := pathForSubKind(c.subKind,
+		types.EnvVinCSSUserPath, types.VinCSSUserPath, "user")
+	bytes, _, err := c.get(userPath)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	var v VinCSSUserResponse
+	if err := json.Unmarshal(bytes, &v); err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	teams := make([]GithubTeamResponse, 0, len(v.TeleportGroup))
+	for _, g := range v.TeleportGroup {
+		teams = append(teams, GithubTeamResponse{
+			Name: g,
+			Slug: g,
+			Org:  GithubOrgResponse{Login: types.VinCSSOrganization},
+		})
+	}
+	return v.toGithubUserResponse(), teams, nil
 }
 
 // GithubTeamResponse represents a single team entry in the "teams" API response
